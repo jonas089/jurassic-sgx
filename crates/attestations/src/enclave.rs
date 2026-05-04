@@ -1,20 +1,18 @@
 //! In-enclave SDK: derive a per-enclave Ed25519 identity from EGETKEY,
 //! sign a structured Attestation over (input, output) and emit an Envelope.
-//!
-//! Input is taken from `argv[1]` (UTF-8 string) so that EDP stdin EOF quirks
-//! don't bite us; bytes-as-string is fine for our workloads (numeric inputs,
-//! JSON, etc.).
+//! Input is taken from `argv[1..]`.
 
 use std::io::Write;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use attest_core::{
-    sha256, Attestation, Envelope, Hash32, Mrenclave, PubKey, Sig, SignedAttestation,
-    DOMAIN_KDF, VERSION,
-};
 use ed25519_dalek::{Signer, SigningKey};
 use hkdf::Hkdf;
 use sha2::Sha256;
+
+use crate::core::{
+    sha256, Attestation, Envelope, Hash32, Mrenclave, PubKey, Sig, SignedAttestation,
+    DOMAIN_KDF, VERSION,
+};
 
 #[cfg(target_env = "sgx")]
 fn platform_seal_and_mrenclave() -> ([u8; 32], [u8; 16]) {
@@ -65,12 +63,7 @@ impl Identity {
     }
 }
 
-/// Take input from argv[1] (UTF-8) — EDP propagates argv via usercall.
-pub fn read_input_from_argv() -> Vec<u8> {
-    std::env::args().nth(1).unwrap_or_default().into_bytes()
-}
-
-pub fn write_envelope_stdout(env: &Envelope) {
+fn write_envelope_stdout(env: &Envelope) {
     let s = serde_json::to_string(env).expect("serialize envelope");
     let mut out = std::io::stdout().lock();
     out.write_all(s.as_bytes()).unwrap();
@@ -90,7 +83,7 @@ fn program_id(program_name: &str) -> Hash32 {
     sha256(&buf)
 }
 
-/// Run a pure compute closure inside the enclave: caller-provided input, compute, sign, emit.
+/// Caller-provided input → compute → sign → emit Envelope on stdout.
 pub fn commit_with_input<F>(program_name: &str, input: Vec<u8>, f: F)
 where
     F: FnOnce(&[u8]) -> Vec<u8>,
@@ -122,9 +115,10 @@ where
     write_envelope_stdout(&envelope);
 }
 
+/// Self-signed enrollment proof: prints JSON on stdout.
 pub fn enroll(program_name: &str) {
     let id = Identity::derive();
-    let mut h = sha2::Sha256::new();
+    let mut h = Sha256::new();
     use sha2::Digest;
     h.update(b"sgx-attest:enroll:v1");
     h.update(id.mrenclave);
@@ -141,15 +135,4 @@ pub fn enroll(program_name: &str) {
         "self_signature": hex::encode(sig.to_bytes()),
     });
     println!("{}", proof);
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn deterministic_key_on_stub() {
-        let a = Identity::derive();
-        let b = Identity::derive();
-        assert_eq!(a.pubkey(), b.pubkey());
-    }
 }

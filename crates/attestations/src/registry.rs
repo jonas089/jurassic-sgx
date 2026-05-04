@@ -1,13 +1,11 @@
 //! Sorted-leaf binary Merkle tree of `(MRENCLAVE, pubkey, program_name)` leaves.
-//!
-//! Leaves are sorted by `MRENCLAVE` for canonical roots. Internal nodes hash
-//! `DOMAIN_NODE || left || right`. Odd-numbered levels duplicate the last leaf.
 
-use attest_core::{Hash32, Leaf, DOMAIN_NODE};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+use crate::core::{Hash32, Leaf, DOMAIN_NODE};
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Registry {
     pub leaves: Vec<Leaf>,
 }
@@ -29,10 +27,9 @@ fn node_hash(left: &Hash32, right: &Hash32) -> Hash32 {
 }
 
 impl Registry {
-    pub fn new() -> Self { Self { leaves: Vec::new() } }
+    pub fn new() -> Self { Self::default() }
 
     pub fn add(&mut self, leaf: Leaf) {
-        // de-dup by MRENCLAVE
         if !self.leaves.iter().any(|l| l.mrenclave == leaf.mrenclave) {
             self.leaves.push(leaf);
         }
@@ -45,18 +42,11 @@ impl Registry {
 
     pub fn root(&self) -> Hash32 {
         let leaves = self.leaf_hashes();
-        if leaves.is_empty() {
-            return [0u8; 32];
-        }
+        if leaves.is_empty() { return [0u8; 32]; }
         let mut layer = leaves;
         while layer.len() > 1 {
-            if layer.len() % 2 == 1 {
-                layer.push(*layer.last().unwrap());
-            }
-            layer = layer
-                .chunks(2)
-                .map(|c| node_hash(&c[0], &c[1]))
-                .collect();
+            if layer.len() % 2 == 1 { layer.push(*layer.last().unwrap()); }
+            layer = layer.chunks(2).map(|c| node_hash(&c[0], &c[1])).collect();
         }
         layer[0]
     }
@@ -70,16 +60,11 @@ impl Registry {
         let mut siblings = Vec::new();
         let mut directions = Vec::new();
         while layer.len() > 1 {
-            if layer.len() % 2 == 1 {
-                layer.push(*layer.last().unwrap());
-            }
+            if layer.len() % 2 == 1 { layer.push(*layer.last().unwrap()); }
             let sib_idx = idx ^ 1;
             siblings.push(layer[sib_idx]);
-            directions.push(idx % 2 == 0); // even index → sibling on the right
-            layer = layer
-                .chunks(2)
-                .map(|c| node_hash(&c[0], &c[1]))
-                .collect();
+            directions.push(idx % 2 == 0);
+            layer = layer.chunks(2).map(|c| node_hash(&c[0], &c[1])).collect();
             idx /= 2;
         }
         Some(MerkleProof { leaf_index, leaf_hash, siblings, directions })
@@ -87,9 +72,7 @@ impl Registry {
 }
 
 pub fn verify_proof(root: &Hash32, leaf: &Leaf, proof: &MerkleProof) -> bool {
-    if leaf.hash() != proof.leaf_hash {
-        return false;
-    }
+    if leaf.hash() != proof.leaf_hash { return false; }
     let mut acc = proof.leaf_hash;
     for (sib, &right) in proof.siblings.iter().zip(proof.directions.iter()) {
         acc = if right { node_hash(&acc, sib) } else { node_hash(sib, &acc) };
@@ -100,7 +83,7 @@ pub fn verify_proof(root: &Hash32, leaf: &Leaf, proof: &MerkleProof) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use attest_core::{Mrenclave, PubKey};
+    use crate::core::{Mrenclave, PubKey};
 
     fn mk_leaf(name: &str, seed: u8) -> Leaf {
         Leaf {

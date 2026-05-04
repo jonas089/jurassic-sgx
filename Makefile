@@ -1,14 +1,10 @@
-## sgx-attest: Rust attestation pipeline on legacy SGX (Fortanix EDP)
+## sgx-attest — Rust attestation pipeline on legacy SGX (Fortanix EDP).
 ##
-## Usage:
-##   make build          # compile host tools + fibonacci enclave (.sgxs)
-##   make enroll         # run fibonacci-enroll inside SGX, append leaf to registry.json
-##   make publish        # print Merkle root of registry.json, write root.txt
-##   make compute N=20   # run fibonacci(N) inside SGX, write envelope.json
-##   make verify         # external-style verification of envelope.json against registry.json
-##   make demo           # full end-to-end: clean, build, enroll, publish, compute, verify
-##   make tamper-test    # mutate the output and confirm the verifier rejects it
-##   make clean          # cargo clean + remove generated artifacts
+## The Makefile only does *builds*. Enclave loading, key derivation,
+## signing, registry, and verification all live inside the `sgx-attest`
+## Rust binary (cli/src/main.rs). It opens /dev/isgx, talks to aesmd,
+## ECREATEs/EADDs/EINITs the enclave, captures its stdout, and processes
+## the result — no `ftxsgx-runner` shellout.
 
 CARGO        ?= cargo
 TARGET       := x86_64-fortanix-unknown-sgx
@@ -17,6 +13,8 @@ SGX_DIR      := target/$(TARGET)/release
 
 ENCLAVE_ELF  := $(SGX_DIR)/fibonacci
 ENCLAVE_SGXS := $(SGX_DIR)/fibonacci.sgxs
+
+CLI          := $(RELEASE_DIR)/sgx-attest
 
 REGISTRY     := registry.json
 ENVELOPE     := envelope.json
@@ -27,18 +25,20 @@ THREADS      := 1
 
 N            ?= 20
 
-.PHONY: all build host-tools enclave enroll publish compute verify demo tamper-test test clean
+.PHONY: all build cli enclave enroll publish run verify demo tamper-test test clean
 
 all: build
 
-build: host-tools enclave
+build: cli enclave
 
-host-tools:
-	$(CARGO) build --release --workspace --exclude fibonacci
+cli: $(CLI)
+
+$(CLI): cli/src/main.rs crates/attestations/src/*.rs
+	$(CARGO) build --release -p sgx-attest-cli
 
 enclave: $(ENCLAVE_SGXS)
 
-$(ENCLAVE_ELF): programs/fibonacci/src/main.rs crates/attest-enclave/src/lib.rs crates/attest-core/src/lib.rs
+$(ENCLAVE_ELF): programs/fibonacci/src/main.rs crates/attestations/src/*.rs
 	$(CARGO) build -p fibonacci --release --target $(TARGET)
 
 $(ENCLAVE_SGXS): $(ENCLAVE_ELF)
@@ -49,40 +49,31 @@ $(ENCLAVE_SGXS): $(ENCLAVE_ELF)
 	    --debug
 
 enroll: build
-	ftxsgx-runner $(ENCLAVE_SGXS) enroll \
-	    | $(RELEASE_DIR)/enroll $(REGISTRY)
+	$(CLI) enroll --sgxs $(ENCLAVE_SGXS) --registry $(REGISTRY)
 
 publish: build
-	$(RELEASE_DIR)/publish-root $(REGISTRY)
+	$(CLI) publish --registry $(REGISTRY)
 
-compute: build
-	ftxsgx-runner $(ENCLAVE_SGXS) compute $(N) > $(ENVELOPE)
-	@echo "wrote $(ENVELOPE) ($$(wc -c < $(ENVELOPE)) bytes)"
+run: build
+	$(CLI) run --sgxs $(ENCLAVE_SGXS) --out $(ENVELOPE) -- $(N)
 
 verify: build
-	$(RELEASE_DIR)/verify-envelope $(REGISTRY) $(ENVELOPE)
+	$(CLI) verify --registry $(REGISTRY) --envelope $(ENVELOPE)
 
 demo: clean-artifacts build
-	@echo "=== ENROLL ==="
-	@$(MAKE) --no-print-directory enroll
-	@echo
-	@echo "=== PUBLISH ==="
-	@$(MAKE) --no-print-directory publish
-	@echo
-	@echo "=== COMPUTE fib($(N)) ==="
-	@$(MAKE) --no-print-directory compute N=$(N)
-	@echo
-	@echo "=== VERIFY ==="
-	@$(MAKE) --no-print-directory verify
+	@echo "=== ENROLL ==="    ; $(MAKE) --no-print-directory enroll
+	@echo                     ; echo "=== PUBLISH ===" ; $(MAKE) --no-print-directory publish
+	@echo                     ; echo "=== RUN fib($(N)) ===" ; $(MAKE) --no-print-directory run N=$(N)
+	@echo                     ; echo "=== VERIFY ===" ; $(MAKE) --no-print-directory verify
 
 tamper-test: build
-	@command -v python3 >/dev/null || { echo "python3 required for tamper-test"; exit 1; }
+	@command -v python3 >/dev/null || { echo "python3 required"; exit 1; }
 	@python3 -c 'import json; e=json.load(open("$(ENVELOPE)")); e["output"]=list(b"{\"fib_n\":\"9999\",\"n\":20}"); open("envelope_tampered.json","w").write(json.dumps(e))'
 	@echo "expecting FAIL:"
-	@! $(RELEASE_DIR)/verify-envelope $(REGISTRY) envelope_tampered.json && echo "tamper-test PASS (verifier rejected)"
+	@! $(CLI) verify --registry $(REGISTRY) --envelope envelope_tampered.json && echo "tamper-test PASS (verifier rejected)"
 
 test:
-	$(CARGO) test --workspace --exclude fibonacci
+	$(CARGO) test -p attestations
 
 clean-artifacts:
 	rm -f $(REGISTRY) $(ENVELOPE) envelope_tampered.json root.txt

@@ -9,7 +9,5 @@ name = "fibonacci"
 path = "src/main.rs"
 
 [dependencies]
-attest-enclave = { workspace = true }
-serde_json     = { workspace = true }
-hex            = { workspace = true, features = ["std"] }
-getrandom      = "0.2"
+attestations = { workspace = true }
+serde_json   = { workspace = true }

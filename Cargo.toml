@@ -1,14 +1,9 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/attest-core",
-    "crates/attest-enclave",
-    "crates/attest-registry",
-    "crates/attest-verify",
+    "crates/attestations",
     "programs/fibonacci",
-    "tools/enroll",
-    "tools/publish-root",
-    "tools/run-and-verify",
+    "cli",
 ]
 
 [workspace.package]
@@ -17,10 +12,7 @@ license = "MIT OR Apache-2.0"
 version = "0.1.0"
 
 [workspace.dependencies]
-attest-core     = { path = "crates/attest-core" }
-attest-enclave  = { path = "crates/attest-enclave" }
-attest-registry = { path = "crates/attest-registry" }
-attest-verify   = { path = "crates/attest-verify" }
+attestations = { path = "crates/attestations" }
 
 ed25519-dalek = { version = "2", default-features = false }
 sha2          = { version = "0.10", default-features = false }
@@ -29,4 +21,4 @@ serde         = { version = "1", default-features = false, features = ["derive"]
 serde_json    = "1"
 hex           = { version = "0.4", default-features = false, features = ["alloc"] }
 sgx-isa       = "0.4"
-rand_core     = "0.6"
+clap          = { version = "4", features = ["derive"] }

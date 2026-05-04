@@ -1,8 +1,5 @@
-#![cfg_attr(not(feature = "std"), no_std)]
-extern crate alloc;
+//! Shared types: Attestation, SignedAttestation, Envelope, Leaf, hashing.
 
-use alloc::string::String;
-use alloc::vec::Vec;
 use core::fmt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -48,7 +45,7 @@ mod serde_arrays {
         v.as_ref().serialize(s)
     }
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; 64], D::Error> {
-        let v: alloc::vec::Vec<u8> = Deserialize::deserialize(d)?;
+        let v: Vec<u8> = Deserialize::deserialize(d)?;
         v.try_into().map_err(|_| serde::de::Error::custom("expected 64 bytes"))
     }
 }
