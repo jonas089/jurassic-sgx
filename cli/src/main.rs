@@ -61,6 +61,25 @@ enum Cmd {
         #[arg(long, default_value = "envelope.json")]
         envelope: PathBuf,
     },
+    /// End-to-end smoke test: enroll, publish, run with N, verify.
+    Demo {
+        #[arg(long)]
+        sgxs: PathBuf,
+        /// Fibonacci index to compute.
+        #[arg(long, default_value_t = 20)]
+        n: u64,
+        #[arg(long, default_value = "registry.json")]
+        registry: PathBuf,
+        #[arg(long, default_value = "envelope.json")]
+        envelope: PathBuf,
+    },
+    /// Tamper test: mutate the envelope output and confirm the verifier rejects.
+    TamperTest {
+        #[arg(long, default_value = "registry.json")]
+        registry: PathBuf,
+        #[arg(long, default_value = "envelope.json")]
+        envelope: PathBuf,
+    },
 }
 
 fn main() {
@@ -70,6 +89,8 @@ fn main() {
         Cmd::Publish { registry } => cmd_publish(&registry),
         Cmd::Run { sgxs, out, enclave_args } => cmd_run(&sgxs, &out, &enclave_args),
         Cmd::Verify { registry, envelope } => cmd_verify(&registry, &envelope),
+        Cmd::Demo { sgxs, n, registry, envelope } => cmd_demo(&sgxs, n, &registry, &envelope),
+        Cmd::TamperTest { registry, envelope } => cmd_tamper_test(&registry, &envelope),
     }
 }
 
@@ -201,6 +222,48 @@ fn cmd_run(sgxs: &PathBuf, out: &PathBuf, enclave_args: &[String]) {
     let raw = run_enclave_capturing(sgxs, &full_args);
     std::fs::write(out, &raw).unwrap();
     println!("wrote {} ({} bytes)", out.display(), raw.len());
+}
+
+fn cmd_demo(sgxs: &PathBuf, n: u64, registry: &PathBuf, envelope: &PathBuf) {
+    // Start fresh.
+    for f in [registry, envelope, &PathBuf::from("envelope_tampered.json"), &PathBuf::from("root.txt")] {
+        let _ = std::fs::remove_file(f);
+    }
+    println!("=== ENROLL ===");
+    cmd_enroll(sgxs, registry);
+    println!("\n=== PUBLISH ===");
+    cmd_publish(registry);
+    println!("\n=== RUN fib({}) ===", n);
+    cmd_run(sgxs, envelope, &[n.to_string()]);
+    println!("\n=== VERIFY ===");
+    cmd_verify(registry, envelope);
+}
+
+fn cmd_tamper_test(registry: &PathBuf, envelope: &PathBuf) {
+    let s = std::fs::read_to_string(envelope).expect("read envelope");
+    let mut e: serde_json::Value = serde_json::from_str(&s).unwrap();
+    // Replace output bytes with bogus content.
+    let bogus = b"{\"fib_n\":\"9999\",\"n\":20}".to_vec();
+    e["output"] = serde_json::Value::Array(
+        bogus.into_iter().map(|b| serde_json::Value::from(b)).collect()
+    );
+    let tampered = PathBuf::from("envelope_tampered.json");
+    std::fs::write(&tampered, serde_json::to_string(&e).unwrap()).unwrap();
+
+    // Run verify in-process and expect failure.
+    let registry_data: Registry =
+        serde_json::from_str(&std::fs::read_to_string(registry).unwrap()).unwrap();
+    let envelope_data: Envelope =
+        serde_json::from_str(&std::fs::read_to_string(&tampered).unwrap()).unwrap();
+    let root = registry_data.root();
+    let mr = envelope_data.signed.att.mrenclave.0;
+    let leaf = registry_data.leaves.iter().find(|l| l.mrenclave.0 == mr).unwrap().clone();
+    let proof = registry_data.prove(&mr).unwrap();
+
+    match verify_envelope(&root, &leaf, &proof, &envelope_data) {
+        Ok(_) => { eprintln!("FAIL: tampered envelope verified — should have been rejected!"); std::process::exit(1); }
+        Err(e) => println!("tamper-test PASS (verifier rejected: {:?})", e),
+    }
 }
 
 fn cmd_verify(registry_path: &PathBuf, envelope_path: &PathBuf) {

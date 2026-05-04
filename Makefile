@@ -1,82 +1,30 @@
-## sgx-attest — Rust attestation pipeline on legacy SGX (Fortanix EDP).
-##
-## The Makefile only does *builds*. Enclave loading, key derivation,
-## signing, registry, and verification all live inside the `sgx-attest`
-## Rust binary (cli/src/main.rs). It opens /dev/isgx, talks to aesmd,
-## ECREATEs/EADDs/EINITs the enclave, captures its stdout, and processes
-## the result — no `ftxsgx-runner` shellout.
+## sgx-attest — build the host CLI and the SGX enclave image.
+## Everything else (enroll/publish/run/verify/demo/tamper-test) is a
+## subcommand of the `sgx-attest` binary itself.
 
-CARGO        ?= cargo
-TARGET       := x86_64-fortanix-unknown-sgx
-RELEASE_DIR  := target/release
-SGX_DIR      := target/$(TARGET)/release
+CLI       := target/release/sgx-attest
+SGXS      := target/x86_64-fortanix-unknown-sgx/release/fibonacci.sgxs
+N         ?= 20
 
-ENCLAVE_ELF  := $(SGX_DIR)/fibonacci
-ENCLAVE_SGXS := $(SGX_DIR)/fibonacci.sgxs
+.PHONY: build demo tamper-test clean
+.DEFAULT_GOAL := build
 
-CLI          := $(RELEASE_DIR)/sgx-attest
+build: $(CLI) $(SGXS)
 
-REGISTRY     := registry.json
-ENVELOPE     := envelope.json
+$(CLI):
+	cargo build --release -p sgx-attest-cli
 
-HEAP_SIZE    := 0x100000
-STACK_SIZE   := 0x40000
-THREADS      := 1
+$(SGXS):
+	cargo build --release -p fibonacci --target x86_64-fortanix-unknown-sgx
+	ftxsgx-elf2sgxs target/x86_64-fortanix-unknown-sgx/release/fibonacci \
+	    --heap-size 0x100000 --stack-size 0x40000 --threads 1 --debug
 
-N            ?= 20
-
-.PHONY: all build cli enclave enroll publish run verify demo tamper-test test clean
-
-all: build
-
-build: cli enclave
-
-cli: $(CLI)
-
-$(CLI): cli/src/main.rs crates/attestations/src/*.rs
-	$(CARGO) build --release -p sgx-attest-cli
-
-enclave: $(ENCLAVE_SGXS)
-
-$(ENCLAVE_ELF): programs/fibonacci/src/main.rs crates/attestations/src/*.rs
-	$(CARGO) build -p fibonacci --release --target $(TARGET)
-
-$(ENCLAVE_SGXS): $(ENCLAVE_ELF)
-	ftxsgx-elf2sgxs $(ENCLAVE_ELF) \
-	    --heap-size $(HEAP_SIZE) \
-	    --stack-size $(STACK_SIZE) \
-	    --threads $(THREADS) \
-	    --debug
-
-enroll: build
-	$(CLI) enroll --sgxs $(ENCLAVE_SGXS) --registry $(REGISTRY)
-
-publish: build
-	$(CLI) publish --registry $(REGISTRY)
-
-run: build
-	$(CLI) run --sgxs $(ENCLAVE_SGXS) --out $(ENVELOPE) -- $(N)
-
-verify: build
-	$(CLI) verify --registry $(REGISTRY) --envelope $(ENVELOPE)
-
-demo: clean-artifacts build
-	@echo "=== ENROLL ==="    ; $(MAKE) --no-print-directory enroll
-	@echo                     ; echo "=== PUBLISH ===" ; $(MAKE) --no-print-directory publish
-	@echo                     ; echo "=== RUN fib($(N)) ===" ; $(MAKE) --no-print-directory run N=$(N)
-	@echo                     ; echo "=== VERIFY ===" ; $(MAKE) --no-print-directory verify
+demo: build
+	$(CLI) demo --sgxs $(SGXS) --n $(N)
 
 tamper-test: build
-	@command -v python3 >/dev/null || { echo "python3 required"; exit 1; }
-	@python3 -c 'import json; e=json.load(open("$(ENVELOPE)")); e["output"]=list(b"{\"fib_n\":\"9999\",\"n\":20}"); open("envelope_tampered.json","w").write(json.dumps(e))'
-	@echo "expecting FAIL:"
-	@! $(CLI) verify --registry $(REGISTRY) --envelope envelope_tampered.json && echo "tamper-test PASS (verifier rejected)"
+	$(CLI) tamper-test
 
-test:
-	$(CARGO) test -p attestations
-
-clean-artifacts:
-	rm -f $(REGISTRY) $(ENVELOPE) envelope_tampered.json root.txt
-
-clean: clean-artifacts
-	$(CARGO) clean
+clean:
+	cargo clean
+	rm -f registry.json envelope.json envelope_tampered.json root.txt
