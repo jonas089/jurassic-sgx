@@ -1,0 +1,9 @@
+/target
+Cargo.lock
+registry.json
+envelope.json
+envelope_tampered.json
+root.txt
+*.swp
+*.bak
+.DS_Store

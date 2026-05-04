@@ -1,0 +1,15 @@
+[package]
+name = "fibonacci"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "fibonacci"
+path = "src/main.rs"
+
+[dependencies]
+attest-enclave = { workspace = true }
+serde_json     = { workspace = true }
+hex            = { workspace = true, features = ["std"] }
+getrandom      = "0.2"

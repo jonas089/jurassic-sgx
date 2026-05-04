@@ -1,0 +1,14 @@
+[package]
+name = "publish-root"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "publish-root"
+path = "src/main.rs"
+
+[dependencies]
+attest-registry = { workspace = true }
+serde_json      = { workspace = true }
+hex             = { workspace = true, features = ["std"] }
