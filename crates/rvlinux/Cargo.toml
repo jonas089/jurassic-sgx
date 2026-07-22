@@ -1,0 +1,14 @@
+[package]
+name = "rvlinux"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+hashbrown = { version = "0.15", default-features = false, features = ["inline-more"] }
+libm = "0.2"
+
+[features]
+default = []
+# Verbose syscall tracing (requires std; host debugging only).
+strace = ["std"]
+std = []

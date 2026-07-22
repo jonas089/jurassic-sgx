@@ -1,0 +1,19 @@
+[package]
+name = "replay-rustc"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "replay-rustc"
+path = "src/main.rs"
+
+[dependencies]
+attestations = { workspace = true, features = ["replay"] }
+serde_json   = { workspace = true }
+hex          = { workspace = true, features = ["std"] }
+# The rvlinux RV64 usermode-Linux emulator (no_std+alloc, builds for
+# x86_64-fortanix-unknown-sgx). The enclave re-executes the real rustc+lld
+# compile inside it and attests the source→binary binding.
+rvlinux           = { path = "../../crates/rvlinux" }
+wrapped-rustc-lib = { path = "../../crates/wrapped-rustc-lib" }

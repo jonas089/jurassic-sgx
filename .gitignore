@@ -3,7 +3,11 @@ Cargo.lock
 registry.json
 envelope.json
 envelope_tampered.json
+envelope_bad.json
 root.txt
+transcript*.json
+/build
+/build2
 *.swp
 *.bak
 .DS_Store
