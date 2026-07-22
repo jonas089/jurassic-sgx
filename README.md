@@ -34,14 +34,49 @@ crates/attestations/      one library:
   src/registry.rs           sorted-leaf binary Merkle tree
   src/verify.rs             pure-Rust external verifier (no SGX)
 
+crates/rvlinux/           a from-scratch, deterministic RV64GC + Zicsr
+                          usermode-Linux emulator (runs unmodified riscv64
+                          ELF binaries, e.g. the real rustc/rust-lld, inside
+                          the enclave). See crates/rvlinux/SPEC.md — the
+                          audit companion doc — and "Emulator spec & audit
+                          notes" below.
+
+compilation/rustc/        verifiable compilation built on top of rvlinux:
+                          single-file and multi-crate-workspace rustc→
+                          rust-lld→run pipelines, kept separate from the
+                          generic attestation/emulator code since it's just
+                          one use case of both.
+
 programs/fibonacci/       example workload (single binary, two modes)
+programs/replay-rustc/    the verifiable-compilation enclave binary
 
 cli/                      one host-side binary (`sgx-attest`):
-                          subcommands enroll / publish / run / verify
+                          subcommands enroll / publish / run / verify /
+                          compile-attest / compile-workspace-attest / ...
                           loads + runs the enclave directly via
                           enclave-runner + sgxs-loaders + aesm-client
                           (no ftxsgx-runner shellout)
 ```
+
+## Emulator spec & audit notes
+
+`crates/rvlinux` is a custom, from-scratch RISC-V emulator — anyone auditing
+this repo should start with **[`crates/rvlinux/SPEC.md`](crates/rvlinux/SPEC.md)**,
+which maps every implemented instruction/syscall against the reference specs
+below and — more importantly — lists every place its behavior *deliberately*
+diverges from real hardware or a real kernel (deterministic time/randomness,
+no `execve`/`fork`, unenforced page protection, partial CSR support, ...).
+Every source file in `crates/rvlinux/src/` also carries function-level doc
+comments tying its logic back to the relevant spec section.
+
+Reference specifications used throughout:
+- RISC-V Instruction Set Manual, Volume I (Unprivileged Architecture):
+  <https://github.com/riscv/riscv-isa-manual> (rendered:
+  <https://riscv.github.io/riscv-isa-manual/snapshot/spec/#vol:unpriv>;
+  ratified releases: <https://riscv.org/specifications/>)
+- RISC-V ELF psABI: <https://github.com/riscv-non-isa/riscv-elf-psabi-doc>
+- Linux generic syscall ABI (riscv64 uses it unmodified):
+  <https://github.com/torvalds/linux/blob/master/include/uapi/asm-generic/unistd.h>
 
 ## Requirements
 

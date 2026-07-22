@@ -1,4 +1,13 @@
 //! ELF64 loading (static + PT_INTERP dynamic) and initial stack construction.
+//!
+//! Implements enough of the generic ELF64 format plus Linux's `binfmt_elf`
+//! stack-construction convention to hand control to a real RISC-V C runtime
+//! startup (glibc's or musl's `_start`) exactly as the kernel's `execve`
+//! would: map `PT_LOAD` segments, then build an argv/envp/auxv stack per the
+//! RISC-V ELF psABI (<https://github.com/riscv-non-isa/riscv-elf-psabi-doc>).
+//! No relocation processing (`.rela.dyn`) is implemented — only what a
+//! static or simply-interpreted (PT_INTERP) binary needs, which is what
+//! `rustc`/`rust-lld`/the compiled programs this emulator runs actually are.
 
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -28,19 +37,38 @@ pub struct LoadedElf {
     pub load_end: u64,
 }
 
+/// Read a little-endian field out of raw ELF bytes at a fixed offset — ELF64
+/// LE is the only variant this loader accepts (checked in `load_elf`), so
+/// there's no need for a general-purpose byte-order-aware parser.
 fn rd16(b: &[u8], off: usize) -> u16 {
     u16::from_le_bytes([b[off], b[off + 1]])
 }
+/// 32-bit counterpart of `rd16`.
 fn rd32(b: &[u8], off: usize) -> u32 {
     u32::from_le_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]])
 }
+/// 64-bit counterpart of `rd16`.
 fn rd64(b: &[u8], off: usize) -> u64 {
     let mut a = [0u8; 8];
     a.copy_from_slice(&b[off..off + 8]);
     u64::from_le_bytes(a)
 }
 
-/// Map one ELF's PT_LOAD segments at `base` (0 for ET_EXEC).
+/// Validate the ELF header (magic, class, byte order, machine = RISC-V per
+/// `e_machine == 243`, the `EM_RISCV` constant the ELF psABI assigns), then
+/// map every `PT_LOAD` program header segment at `base` (0 for `ET_EXEC` —
+/// a fixed, non-relocatable executable — or `base_hint` for `ET_DYN`, i.e. a
+/// PIE or the dynamic linker itself). For each segment: the file-backed
+/// part is mapped directly against the ELF's own bytes (`Backing::File`,
+/// so segment permissions/content need no copying), and — the standard ELF
+/// "segment's memory size can exceed its file size" BSS convention — any
+/// remaining `p_memsz - p_filesz` tail is zero-filled, split between
+/// zeroing the last partial file page in place and a fresh all-zero mapping
+/// for any further whole pages. `AT_PHDR` prefers an explicit `PT_PHDR`
+/// segment (present for a real ET_DYN/interpreter) and falls back to
+/// `base + e_phoff` otherwise (valid exactly when the first file page,
+/// which contains the ELF header and program headers, is itself mapped —
+/// true for every ET_EXEC binary this emulator loads).
 pub fn load_elf(
     mem: &mut Memory,
     data: &Arc<Vec<u8>>,
@@ -151,6 +179,17 @@ pub struct StartInfo {
 
 /// Load exe (+ its interpreter if dynamic), build the initial stack.
 /// `lookup` resolves an absolute path to file bytes (for the interpreter).
+///
+/// The stack layout below (strings first, then argv/envp/auxv pointer
+/// arrays, `sp` 16-byte aligned per the RISC-V psABI's calling-convention
+/// requirement on stack alignment at a function entry point — `_start` is
+/// no exception) is exactly what a real Linux kernel's `execve` places on
+/// the initial stack before jumping to `e_entry`; this is what lets an
+/// unmodified glibc/musl `_start` (which expects precisely this layout, not
+/// anything emulator-specific) find argc/argv/envp/auxv and bootstrap the C
+/// runtime normally. `AT_RANDOM` is a fixed 16-byte constant rather than
+/// real entropy — see `../SPEC.md`'s "Deterministic randomness" note, same
+/// reasoning as `Machine::next_random`.
 pub fn setup_process(
     mem: &mut Memory,
     exe_data: Arc<Vec<u8>>,

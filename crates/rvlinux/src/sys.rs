@@ -1,4 +1,14 @@
 //! Linux syscall emulation (riscv64 ABI), deterministic by construction.
+//!
+//! Numbers and the `a0..a5` argument / `a0` return-value convention are the
+//! generic Linux syscall ABI riscv64 uses unmodified:
+//! <https://github.com/torvalds/linux/blob/master/include/uapi/asm-generic/unistd.h>.
+//! `../SPEC.md`'s syscall coverage table is the audit-facing summary of what
+//! is and isn't implemented here, and — the important part for a security
+//! review — every place a syscall's behavior is a deliberate stand-in for
+//! something a real kernel would do differently (deterministic time/
+//! randomness, no `execve`/`fork`, no real signals/network). This file is
+//! that table's implementation.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -36,7 +46,11 @@ const S_IFCHR: u32 = 0o020000;
 
 impl Machine {
     /// Resolve a (dirfd, path) pair to a normalized absolute path (before
-    /// symlink resolution).
+    /// symlink resolution) — the shared logic behind every `*at` syscall's
+    /// `AT_FDCWD`-or-directory-fd argument (`openat`, `mkdirat`, `unlinkat`,
+    /// ...): an absolute `path` ignores `dirfd` entirely per POSIX, and a
+    /// relative one resolves against either the process cwd (`AT_FDCWD`) or
+    /// whatever directory `dirfd` was opened on.
     fn at_path(&mut self, dirfd: i64, path_ptr: u64) -> Result<String, i64> {
         let raw = self
             .mem
@@ -58,6 +72,12 @@ impl Machine {
         Ok(normalize(&base, &path))
     }
 
+    /// Fill a Linux `struct stat` (the riscv64 layout, 128 bytes) at `addr`
+    /// from an already-resolved fd/path. Shared by `fstat`/`newfstatat`/
+    /// `statx`'s common case. `st_dev` is a fixed constant (23) and
+    /// `st_atime`/`st_mtime`/`st_ctime` are all pinned to the same fixed
+    /// epoch (`1_700_000_000`) rather than real timestamps — deliberate,
+    /// same determinism reasoning as `Machine::time_ns` (see SPEC.md).
     fn write_stat(&mut self, addr: u64, node_path: Option<&str>, kind: &FdKind) -> Result<(), i64> {
         let mut buf = [0u8; 128];
         let put32 = |b: &mut [u8; 128], off: usize, v: u32| b[off..off + 4].copy_from_slice(&v.to_le_bytes());
@@ -102,6 +122,9 @@ impl Machine {
         self.mem.write_bytes(addr, &buf).map_err(|_| EFAULT)
     }
 
+    /// `stat`/`lstat`-by-path: resolve `path` (following the final symlink
+    /// component iff `follow`, the `stat`-vs-`lstat` distinction), then
+    /// delegate to `write_stat`.
     fn stat_path(&mut self, path: &str, follow: bool, addr: u64) -> Result<(), i64> {
         let resolved = self.fs.resolve(path, follow)?;
         match self.fs.get(&resolved) {
@@ -117,9 +140,20 @@ impl Machine {
         }
     }
 
+    /// The syscall dispatch table: `n` is the number that arrived in `a7`
+    /// (see `cpu.rs`'s `op::ECALL` arm — this is called right after that),
+    /// `a` is `a0..a5`. One `match` arm (or small group of related numbers)
+    /// per syscall; arms are grouped loosely by purpose with comments below,
+    /// not alphabetically or numerically, matching how they read most
+    /// naturally rather than any particular ordering requirement (`match`
+    /// doesn't care about arm order). `Unhandled` (the catch-all) surfaces
+    /// as `RunError::UnhandledSyscall` in `lib.rs` — a syscall this
+    /// interpreter has genuinely never seen, as opposed to one it
+    /// deliberately stubs (which returns an explicit `Ret`/error instead).
     pub(crate) fn syscall(&mut self, n: u64, a: [u64; 6]) -> SysResult {
         use SysResult::*;
         match n {
+            // ---- getcwd/dup/fcntl: fd and cwd bookkeeping ----
             17 => {
                 // getcwd
                 let cwd = self.cwd.clone();
@@ -232,6 +266,8 @@ impl Machine {
                 }
             }
             29 => Ret(-ENOTTY), // ioctl
+            // ---- filesystem namespace: mkdir/unlink/symlink/link/rename
+            // (all `*at`, resolved via `at_path` above) ----
             34 => {
                 // mkdirat
                 let path = match self.at_path(a[0] as i64, a[1]) {
@@ -358,6 +394,7 @@ impl Machine {
                     None => Ret(-ENOENT),
                 }
             }
+            // ---- filesystem metadata / access checks ----
             43 | 44 => {
                 // statfs / fstatfs: dummy tmpfs
                 let mut buf = [0u8; 120];
@@ -422,6 +459,7 @@ impl Machine {
             }
             52 | 53 => Ret(0), // fchmod / fchmodat (permissions don't matter)
             55 | 54 => Ret(0), // fchown / fchownat
+            // ---- open/close/pipe ----
             56 => {
                 // openat
                 let flags = a[2];
@@ -510,6 +548,7 @@ impl Machine {
                 }
                 Ret(0)
             }
+            // ---- directory reading + seeking ----
             61 => {
                 // getdents64
                 let fd = a[0] as i64;
@@ -586,6 +625,8 @@ impl Machine {
                     None => Ret(-EBADF),
                 }
             }
+            // ---- read/write family (see sys_read/sys_write/sys_futex
+            // below for the implementations these delegate to) ----
             63 => self.sys_read(a[0] as i64, a[1], a[2] as usize),
             64 => self.sys_write(a[0] as i64, a[1], a[2] as usize),
             65 | 66 => {
@@ -668,6 +709,7 @@ impl Machine {
                     None => Ret(-EBADF),
                 }
             }
+            // ---- zero-copy transfer + polling ----
             71 => {
                 // sendfile(out, in, offset_ptr, count)
                 let (in_path, in_pos) = match self.fdt.get(a[1] as i64).map(|f| f.kind.clone()) {
@@ -748,6 +790,7 @@ impl Machine {
                     },
                 })
             }
+            // ---- symlink + stat family ----
             78 => {
                 // readlinkat
                 let path = match self.at_path(a[0] as i64, a[1]) {
@@ -807,6 +850,10 @@ impl Machine {
             }
             81 | 82 | 83 => Ret(0), // sync/fsync/fdatasync
             88 => Ret(0),           // utimensat
+            // ---- process/thread lifecycle. exit/exit_group map straight to
+            // SysResult variants lib.rs's scheduler acts on directly (see
+            // Machine::thread_exit); waitid always ECHILD since fork/execve
+            // don't exist, so there is never a child process to reap. ----
             93 => ExitThread(a[0] as i32),
             94 => ExitGroup(a[0] as i32),
             95 => Ret(-ECHILD), // waitid
@@ -816,6 +863,10 @@ impl Machine {
                 self.cur_hart_mut().clear_child_tid = a[0];
                 Ret(tid as i64)
             }
+            // ---- synchronization + time. nanosleep is a no-op (`Ret(0)`,
+            // i.e. "slept for the full duration instantly") rather than
+            // actually blocking — there's no wall clock to sleep against
+            // (see time_ns's doc), so any duration completes immediately. ----
             98 => self.sys_futex(a),
             99 => Ret(-ENOSYS), // set_robust_list
             101 | 115 => Ret(0), // nanosleep / clock_nanosleep
@@ -836,6 +887,9 @@ impl Machine {
                 let _ = self.mem.sd(a[1] + 8, 1);
                 Ret(0)
             }
+            // ---- scheduling/affinity: always exactly one virtual CPU,
+            // since there is only ever one hart executing at a time
+            // (see lib.rs's concurrency doc) ----
             122 => Ret(0), // sched_setaffinity
             123 => {
                 // sched_getaffinity: one CPU
@@ -850,6 +904,12 @@ impl Machine {
                 // sched_yield: handled as reschedule point by machine
                 Ret(0)
             }
+            // ---- signals: stubs only, see SPEC.md's "no real signal
+            // delivery" note. Only SIGABRT (6) does anything at all — it
+            // exits with code 134, matching what an uncaught SIGABRT looks
+            // like from a real shell — every other signal is silently
+            // accepted and ignored, and sigaction/sigprocmask/sigaltstack
+            // always report "nothing installed/blocked." ----
             129 | 130 | 131 => {
                 // kill / tkill / tgkill
                 let sig = if n == 131 { a[2] } else { a[1] };
@@ -901,6 +961,7 @@ impl Machine {
             }
             154 | 155 => Ret(if n == 155 { 1 } else { 0 }), // setpgid / getpgid
             157 => Ret(1),                                   // setsid
+            // ---- system identity / resource info ----
             160 => {
                 // uname
                 let mut buf = [0u8; 65 * 6];
@@ -959,8 +1020,14 @@ impl Machine {
                 }
                 Ret(0)
             }
+            // ---- network: unsupported entirely (see SPEC.md) ----
             198 => Ret(-EAFNOSUPPORT), // socket
             203 => Ret(-EBADF),        // connect
+
+            // ---- memory management: brk/mmap/munmap/mremap/mprotect/
+            // madvise, all backed by mem.rs's VMA tracking (see that
+            // module's docs for what each op actually does at that layer;
+            // arms here are mostly argument parsing + flag translation) ----
             214 => {
                 // brk
                 let cur = self.mem.brk;
@@ -1012,6 +1079,11 @@ impl Machine {
                 self.mem.unmap(old, oldsz);
                 Ret(newaddr as i64)
             }
+            // clone: see sys_clone's doc — only CLONE_VM (thread creation)
+            // is supported, fork is rejected. execve: always ENOSYS, no
+            // guest program can ever replace its image or spawn another —
+            // see SPEC.md, this is the single most consequential
+            // deliberate deviation from a real kernel in this whole file.
             220 => self.sys_clone(a),
             221 => Ret(-ENOSYS), // execve
             222 => {
@@ -1078,6 +1150,10 @@ impl Machine {
                 }
                 Ret(0)
             }
+            // riscv_hwprobe: RISC-V-specific syscall glibc uses to detect
+            // extension/erratum support at runtime. Reports a fixed
+            // IMAFDC feature set matching exactly what cpu.rs implements
+            // (see SPEC.md), regardless of the actual host CPU underneath.
             258 => {
                 // riscv_hwprobe(pairs, count, cpusetsize, cpus, flags)
                 for i in 0..a[1] {
@@ -1122,6 +1198,11 @@ impl Machine {
                 }
                 Ret(0)
             }
+            // ---- entropy + misc. getrandom is backed by
+            // Machine::next_random (fixed-seed xorshift64*, not real
+            // entropy — see that function's doc and SPEC.md) rather than a
+            // real RNG; every guest program that seeds anything from
+            // getrandom therefore behaves identically across runs. ----
             278 => {
                 // getrandom: deterministic stream
                 let mut buf = alloc::vec![0u8; a[1] as usize];
@@ -1216,6 +1297,11 @@ impl Machine {
                     Err(e) => Ret(-e),
                 }
             }
+            // statx: the modern extended-stat syscall glibc prefers when
+            // available; duplicates write_stat's mode/size/ino logic
+            // inline (into the different, larger statx buffer layout)
+            // rather than sharing it, since the two structs' field offsets
+            // don't line up.
             291 => {
                 // statx(dirfd, path, flags, mask, buf)
                 const AT_EMPTY_PATH: u64 = 0x1000;
@@ -1295,6 +1381,13 @@ impl Machine {
                 }
                 Ret(0)
             }
+            // ---- newer syscalls this interpreter doesn't implement,
+            // rejected with ENOSYS specifically because glibc's own
+            // fallback path for "kernel doesn't have this" is to use an
+            // older equivalent instead (rseq → nothing needed since there's
+            // only ever one hart running at once; clone3 → plain clone,
+            // which sys_clone above does handle) — so returning ENOSYS here
+            // is the correct way to make glibc take that path itself. ----
             293 => Ret(-ENOSYS), // rseq
             435 => Ret(-ENOSYS), // clone3 -> glibc falls back to clone
             436 => {
@@ -1310,6 +1403,13 @@ impl Machine {
         }
     }
 
+    /// `poll(2)`'s per-fd readiness check against the *requested* event
+    /// mask (`POLLIN`/`POLLOUT`/`POLLHUP`) — used directly by the `ppoll`
+    /// syscall arm above; `lib.rs` has its own copy (`poll_fd_pub`) for the
+    /// scheduler's `try_unblock` path, since that lives outside this
+    /// `impl` block. Non-pipe fds (regular files) are always "ready" for
+    /// both directions — there's no real blocking I/O to wait on for them
+    /// in this filesystem.
     fn poll_fd(&self, fd: i64, events: u16) -> u16 {
         const POLLIN: u16 = 1;
         const POLLOUT: u16 = 4;
@@ -1340,6 +1440,13 @@ impl Machine {
         }
     }
 
+    /// The common "write these bytes to whatever this fd is" logic shared
+    /// by `write`/`writev`/`sendfile`/`copy_file_range`'s destination side:
+    /// stdout/stderr append to the in-memory buffers the enclave later
+    /// hashes into the attestation, a pipe write enqueues into the pipe's
+    /// backing buffer, and a regular file writes at its current position
+    /// (or at EOF, for `O_APPEND` — the standard POSIX append-mode
+    /// contract) via `Fs::write_at`.
     fn write_to_fd(&mut self, fd: i64, data: &[u8]) -> Result<usize, i64> {
         match self.fdt.get(fd).map(|f| f.kind.clone()) {
             Some(FdKind::Stdout) => {
@@ -1378,6 +1485,10 @@ impl Machine {
         }
     }
 
+    /// `write(2)`: read the guest's source buffer out of memory, then hand
+    /// it to `write_to_fd`. Split out from the syscall-number match purely
+    /// so `readv`/`writev` (syscalls 65/66 above) can call the same
+    /// per-iovec logic without duplicating it.
     fn sys_write(&mut self, fd: i64, buf: u64, len: usize) -> SysResult {
         let data = match self.mem.read_bytes(buf, len) {
             Ok(d) => d,
@@ -1389,6 +1500,13 @@ impl Machine {
         }
     }
 
+    /// `read(2)`'s per-fd-kind logic (also shared with `readv`): regular
+    /// files read straight from the fs snapshot at the current position;
+    /// a pipe with data returns it immediately, an empty pipe with open
+    /// writers *blocks* (`SysResult::Block`, resolved later by
+    /// `Machine::try_unblock` once data or EOF becomes available) unless
+    /// `O_NONBLOCK` says to return `EAGAIN` instead — the standard POSIX
+    /// blocking-vs-nonblocking-read contract for pipes.
     fn sys_read(&mut self, fd: i64, buf: u64, len: usize) -> SysResult {
         use SysResult::*;
         match self.fdt.get(fd).map(|f| (f.kind.clone(), f.nonblock)) {
@@ -1439,6 +1557,17 @@ impl Machine {
         }
     }
 
+    /// Linux `futex(2)` — the kernel-assisted low-level primitive glibc's
+    /// mutex/condvar/once implementation is built on (not a RISC-V ISA
+    /// concept; a userspace atomic op via the A extension handles the
+    /// uncontended fast path, and only falls into this syscall when it
+    /// needs to actually block or wake another thread). `WAIT` re-checks
+    /// the futex word still equals the expected value before blocking
+    /// (`EAGAIN` if it already changed — avoids a lost-wakeup race) and
+    /// supports the `_BITSET` variants' selective wake groups;
+    /// `REQUEUE`/`CMP_REQUEUE` move waiters to a different futex word
+    /// without waking them (see `Machine::futex_requeue`'s doc for why
+    /// that optimization exists).
     fn sys_futex(&mut self, a: [u64; 6]) -> SysResult {
         use SysResult::*;
         const FUTEX_WAIT: u64 = 0;
@@ -1500,6 +1629,17 @@ impl Machine {
         }
     }
 
+    /// `clone(2)`: Linux's single syscall behind both `fork` and thread
+    /// creation, distinguished by `CLONE_VM` (shared address space —
+    /// "this is a thread"). Only that case is implemented — a genuine
+    /// `fork` (separate address space, copy-on-write) would need process
+    /// duplication this emulator has no concept of, so it's rejected with
+    /// `ENOSYS` (see SPEC.md: this is the same architectural boundary as
+    /// `execve` always failing). For the supported case, parses which of
+    /// `CLONE_PARENT_SETTID`/`CLONE_CHILD_SETTID`/`CLONE_CHILD_CLEARTID`/
+    /// `CLONE_SETTLS` were requested and wires up `Machine::spawn_thread`
+    /// accordingly — this is exactly what a real kernel's `clone` does to
+    /// support glibc's `pthread_create`.
     fn sys_clone(&mut self, a: [u64; 6]) -> SysResult {
         const CLONE_VM: u64 = 0x100;
         const CLONE_SETTLS: u64 = 0x80000;

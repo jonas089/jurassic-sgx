@@ -1,8 +1,18 @@
-//! rvlinux: a deterministic RV64GC usermode Linux emulator.
+//! rvlinux: a deterministic RV64GC + Zicsr usermode Linux emulator.
 //!
 //! Runs unmodified riscv64-linux binaries (including rustc) against an
 //! in-memory filesystem with cooperative threading. no_std + alloc so the
 //! same code runs on the host and inside the SP1 zkVM guest.
+//!
+//! **Auditors start here: [`../SPEC.md`](../SPEC.md)** — instruction set /
+//! syscall coverage tables against the RISC-V and Linux specs, and every
+//! place this interpreter's behavior deliberately deviates from real
+//! hardware or a real kernel (determinism substitutions, `execve`/`fork`
+//! being unsupported, unenforced page protection, partial CSR support,
+//! ...). This module (`Machine`) owns the piece SPEC.md calls out as the
+//! core determinism guarantee: exactly one hart runs at a time, so
+//! scheduling is a pure function of instruction counts, never of
+//! wall-clock/host timing.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
@@ -147,6 +157,11 @@ pub struct RunOutcome {
 const TIMESLICE: u64 = 500_000;
 
 impl Machine {
+    /// A process with no harts yet (added by `load_program`) and empty
+    /// per-process state. `rng_state`'s seed is a fixed constant, not real
+    /// entropy — see `next_random`'s doc and SPEC.md's "deterministic
+    /// randomness" note; this is not spec-mandated behavior, it's this
+    /// interpreter's determinism guarantee.
     pub fn new(fs: Fs, cwd: &str) -> Self {
         Machine {
             mem: Memory::new(),
@@ -169,7 +184,11 @@ impl Machine {
     }
 
     /// Write back MAP_SHARED regions overlapping [start, start+len) to their
-    /// files; len == u64::MAX flushes (and drops) everything.
+    /// files; len == u64::MAX flushes (and drops) everything. This is the
+    /// Linux `mmap(MAP_SHARED)`/`msync` write-back contract, implemented at
+    /// the syscall layer rather than as a real shared page-table mapping:
+    /// `sys.rs`'s `mmap`/`munmap`/`msync` handlers call this at exactly the
+    /// points real Linux would flush dirty shared pages.
     pub(crate) fn flush_shared(&mut self, start: u64, len: u64) {
         let end = start.saturating_add(len);
         let mut remaining = Vec::new();
@@ -191,7 +210,13 @@ impl Machine {
         self.shared_maps = remaining;
     }
 
-    /// Load `exe_path` from the in-memory fs with argv/envp; prepare hart 0.
+    /// Resolve and read `exe_path` from the in-memory fs, hand it to
+    /// `loader::setup_process` (ELF mapping + argv/envp/auxv stack layout
+    /// per the psABI, see `loader.rs`'s doc), then create hart 0 with `pc`/
+    /// `sp` at the values the loader computed — this is the RISC-V/Linux
+    /// equivalent of what the kernel's `execve` does when starting a fresh
+    /// process image, done once here since this emulator has no `execve`
+    /// syscall of its own (see SPEC.md).
     pub fn load_program(
         &mut self,
         exe_path: &str,
@@ -229,25 +254,39 @@ impl Machine {
         Ok(())
     }
 
-    /// Consume the machine, returning the (possibly modified) filesystem.
+    /// Consume the machine, returning the (possibly modified) filesystem —
+    /// how the pipeline in `compilation/rustc` chains multiple `Machine`
+    /// runs (rustc, then rust-lld) over the same evolving fs without
+    /// re-parsing the toolchain bundle each time.
     pub fn into_fs(self) -> Fs {
         self.fs
     }
 
+    /// The Linux thread ID of whichever hart the scheduler last selected
+    /// (`self.cur`) — backs the `gettid`/`set_tid_address` syscalls.
     pub(crate) fn cur_tid(&self) -> u64 {
         self.harts[self.cur].hart.tid
     }
 
+    /// Mutable access to the currently-scheduled hart's architectural state
+    /// — used by syscall handlers that need to read/write registers
+    /// (e.g. `set_tid_address` writing `clear_child_tid`).
     pub(crate) fn cur_hart_mut(&mut self) -> &mut Hart {
         &mut self.harts[self.cur].hart
     }
 
+    /// Deterministic stand-in for the wall clock (`clock_gettime`,
+    /// `gettimeofday`, ...): a fixed epoch plus 2ns per instruction retired,
+    /// never real time. See SPEC.md's "Deterministic time" note.
     pub(crate) fn time_ns(&self) -> u64 {
         1_784_720_659_000_000_000 + self.instret.wrapping_mul(2)
     }
 
+    /// Deterministic stand-in for `getrandom`/`AT_RANDOM`: xorshift64* from a
+    /// fixed seed, never real entropy. See SPEC.md's "Deterministic
+    /// randomness" note — nothing that reads this should be treated as
+    /// unpredictable.
     pub(crate) fn next_random(&mut self) -> u64 {
-        // xorshift64*
         let mut x = self.rng_state;
         x ^= x >> 12;
         x ^= x << 25;
@@ -256,6 +295,16 @@ impl Machine {
         x.wrapping_mul(0x2545F4914F6CDD1D)
     }
 
+    /// Backs `clone(CLONE_VM, ...)` (thread creation, as opposed to `fork`
+    /// — see `sys_clone`'s doc for why only the `CLONE_VM` case is
+    /// supported at all). Copies the parent hart's full register file —
+    /// per the Linux thread-creation contract, a new thread starts with
+    /// the same general/float registers as its creator, just after the
+    /// `clone` ecall — then overrides only what the clone flags say to
+    /// change: the new stack pointer (always), `a0`=0 (the child's return
+    /// value from `clone`, matching every other `fork`-family syscall's
+    /// "0 in the child" convention), and TLS (`tp`, RISC-V's thread-pointer
+    /// register) if `CLONE_SETTLS` was requested.
     pub(crate) fn spawn_thread(&mut self, sp: u64, tls: u64, set_tls: bool) -> u64 {
         let parent = &self.harts[self.cur].hart;
         let mut child = Hart::new(self.next_tid);
@@ -277,6 +326,10 @@ impl Machine {
         tid
     }
 
+    /// Records where to zero + futex-wake on thread exit (glibc's
+    /// `pthread_join` implementation relies on `CLONE_CHILD_CLEARTID`
+    /// doing exactly this — see `thread_exit` below, which is where it's
+    /// consumed).
     pub(crate) fn set_clear_child_tid(&mut self, tid: u64, addr: u64) {
         for slot in &mut self.harts {
             if slot.hart.tid == tid {
@@ -285,7 +338,11 @@ impl Machine {
         }
     }
 
-    /// Wake up to `max` harts futex-waiting on `addr` (bitset intersect).
+    /// `FUTEX_WAKE`/`FUTEX_WAKE_BITSET` (Linux futex(2), not a RISC-V ISA
+    /// concept — `futex` is a syscall-level primitive glibc's mutex/condvar
+    /// implementation is built on): scans blocked harts for a
+    /// bitset-intersecting match on `addr`, resumes up to `max` of them
+    /// with a `0` return value (the real `FUTEX_WAIT` success return).
     pub(crate) fn futex_wake(&mut self, addr: u64, max: usize, bitset: u32) -> usize {
         let mut n = 0;
         for slot in &mut self.harts {
@@ -308,6 +365,11 @@ impl Machine {
         n
     }
 
+    /// `FUTEX_REQUEUE`/`FUTEX_CMP_REQUEUE`: moves up to `max` harts blocked
+    /// on futex `from` to instead wait on futex `to`, without waking them —
+    /// the standard glibc condvar-implementation optimization (move waiters
+    /// to the mutex's futex on `pthread_cond_signal` instead of waking them
+    /// all just to immediately re-block on the mutex).
     pub(crate) fn futex_requeue(&mut self, from: u64, to: u64, max: usize) -> usize {
         let mut n = 0;
         for slot in &mut self.harts {
@@ -324,6 +386,13 @@ impl Machine {
         n
     }
 
+    /// Backs `exit`/`exit_group` for one thread: marks it exited and, per
+    /// the `CLONE_CHILD_CLEARTID` contract (see `set_clear_child_tid`),
+    /// zeroes `clear_child_tid` in guest memory and futex-wakes anyone
+    /// joining on it (this is precisely the kernel behavior glibc's
+    /// `pthread_join` depends on). If that was the last runnable thread,
+    /// the whole process is now done — sets `exit_code`, which
+    /// `run_reporting`'s main loop checks every iteration.
     fn thread_exit(&mut self, code: i32) {
         let idx = self.cur;
         let ctid = self.harts[idx].hart.clear_child_tid;
@@ -342,7 +411,15 @@ impl Machine {
         }
     }
 
-    /// Re-check whether a blocked hart can make progress.
+    /// Re-check whether a blocked hart can make progress — called from the
+    /// scheduler (`run_reporting`) only once *every* hart is blocked, to
+    /// decide whether any of them can actually be resumed (a pipe with data
+    /// now available, a poll whose fd became ready) versus a genuine
+    /// deadlock. Futex waits never resolve here (`false`, with a comment
+    /// explaining why) — only `futex_wake`/`futex_requeue`, triggered by
+    /// another hart's syscall, can unblock those; if every hart is
+    /// simultaneously futex-blocked with none of them a waker, that's a
+    /// real deadlock and `run_reporting` reports it as one.
     fn try_unblock(&mut self, idx: usize) -> bool {
         let block = match &self.harts[idx].state {
             HartState::Blocked(b) => b.clone(),
@@ -405,8 +482,13 @@ impl Machine {
         }
     }
 
+    /// `poll(2)`'s per-fd "which requested events are currently ready"
+    /// check (`POLLIN`/`POLLOUT`/`POLLHUP` bits) — duplicated from `sys.rs`
+    /// (which has its own private `poll_fd` for the direct `ppoll` syscall
+    /// path) purely because `try_unblock` needs it too and `sys.rs`'s
+    /// version isn't visible outside that module's `impl` block. No spec
+    /// content beyond the standard POSIX poll-event semantics.
     fn poll_fd_pub(&self, fd: i64, events: u16) -> u16 {
-        // small shim used by try_unblock (poll_fd is private to sys.rs impl)
         const POLLIN: u16 = 1;
         const POLLOUT: u16 = 4;
         const POLLHUP: u16 = 0x10;
@@ -442,10 +524,23 @@ impl Machine {
         self.run_reporting(max_instret, 0, &mut |_| {})
     }
 
-    /// Like [`run`], but call `on_progress(instret)` roughly every
+    /// The process-level scheduler: round-robins runnable harts in fixed
+    /// `TIMESLICE`-instruction chunks (`cpu::run` executes one chunk, then
+    /// returns why it stopped), dispatches `Stop::Ecall` to `syscall`, and
+    /// keeps going until every thread has exited (`exit_code` set) or
+    /// nothing can make progress (`RunError::Deadlock`). This — not
+    /// anything in the ISA — is the actual source of this interpreter's
+    /// determinism: which hart runs next, and for how long, is a pure
+    /// function of instruction counts and syscall results, never of
+    /// wall-clock/host scheduling, so the exact same interleaving happens
+    /// on every run of the exact same program (see SPEC.md's "Memory model
+    /// & concurrency" section for why that also means no real hart
+    /// interleaving/races are possible in the first place).
+    ///
+    /// Like [`Self::run`], but call `on_progress(instret)` roughly every
     /// `report_every` executed instructions (`0` disables it). Reporting is
     /// checked at the top of the scheduler loop and never alters budgeting or
-    /// scheduling, so results are byte-identical to [`run`].
+    /// scheduling, so results are byte-identical to [`Self::run`].
     pub fn run_reporting(
         &mut self,
         max_instret: u64,

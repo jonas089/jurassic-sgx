@@ -8,6 +8,15 @@
 //!     mode     u32
 //!     path_len u32, path bytes (utf-8, absolute, normalized)
 //!     data_len u32, data bytes (file content / symlink target; 0 for dir)
+//!
+//! This is a format this project invented, not a RISC-V/Linux spec artifact
+//! — its only "correctness" requirement is that `Builder::build`'s output
+//! and `parse_into`'s expectations agree byte-for-byte, which the layout
+//! comment above and the code below are the joint source of truth for.
+//! Entries are written sorted by path (`build`) purely so the same file set
+//! always serializes to identical bytes — another piece of this project's
+//! reproducibility story: two builds of the same toolchain/source tree
+//! bundle byte-identically, so its hash is stable.
 
 use alloc::borrow::ToOwned;
 use alloc::string::String;
@@ -24,6 +33,11 @@ pub enum BundleError {
     BadPath,
 }
 
+/// Unpack a ZKFS1-format byte blob into `fs` (this is the guest/enclave-side
+/// half — see `Builder` for the host side that produces the bytes this
+/// reads). Every length field is bounds-checked against the remaining input
+/// before use, so a truncated or malformed blob fails with `BundleError`
+/// rather than reading past the end of `data`.
 pub fn parse_into(fs: &mut Fs, data: &[u8]) -> Result<u32, BundleError> {
     if data.len() < 12 || &data[..8] != MAGIC {
         return Err(BundleError::BadMagic);
@@ -79,21 +93,33 @@ pub struct Builder {
 }
 
 impl Builder {
+    /// Start collecting entries for a new bundle.
     pub fn new() -> Self {
         Builder {
             entries: Vec::new(),
         }
     }
+    /// Queue an explicit directory entry — usually unnecessary, since
+    /// `parse_into` → `Fs::add_file`/`add_symlink` auto-create parent
+    /// directories on the read side anyway; useful for an empty directory
+    /// that would otherwise never get created.
     pub fn dir(&mut self, path: &str) {
         self.entries.push((path.into(), 0, 0o755, Vec::new()));
     }
+    /// Queue a file entry with its full contents and Unix permission bits.
     pub fn file(&mut self, path: &str, data: Vec<u8>, mode: u32) {
         self.entries.push((path.into(), 1, mode, data));
     }
+    /// Queue a symlink entry (`target` stored verbatim, not validated or
+    /// resolved at build time).
     pub fn symlink(&mut self, path: &str, target: &str) {
         self.entries
             .push((path.into(), 2, 0o777, target.as_bytes().to_vec()));
     }
+    /// Serialize every queued entry into the ZKFS1 byte format (module doc
+    /// above has the exact layout). Sorts by path first so the same set of
+    /// entries always produces byte-identical output regardless of the
+    /// order they were queued in.
     pub fn build(mut self) -> Vec<u8> {
         self.entries.sort_by(|a, b| a.0.cmp(&b.0));
         let mut out = Vec::new();

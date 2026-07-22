@@ -8,6 +8,12 @@
 //! Floating point uses host f32/f64 (both the Apple Silicon host and the SP1
 //! guest are IEEE-754); rounding modes are honored for conversions (where
 //! compilers emit RTZ) and ignored for arithmetic (rustc never changes frm).
+//!
+//! Implements the unprivileged ISA only (RV32I/RV64I base, M, A, F, D, C,
+//! partial Zicsr) — see `../SPEC.md` for the exact coverage table, the
+//! floating-point and CSR caveats, and why no privileged-mode state exists
+//! here at all. Spec: <https://github.com/riscv/riscv-isa-manual>
+//! (rendered: <https://riscv.github.io/riscv-isa-manual/snapshot/spec/#vol:unpriv>).
 
 use crate::mem::{MemFault, Memory, PAGE_SHIFT};
 use crate::FxMap;
@@ -26,6 +32,11 @@ pub struct Hart {
 }
 
 impl Hart {
+    /// Fresh architectural state for one hart: all 32 GPRs zeroed (`x0` stays
+    /// hardwired zero for the hart's lifetime — see `wr!` in `run` below),
+    /// all 32 FPRs holding a NaN-boxed f32 NaN (the spec-defined power-on
+    /// value for an implementation with no reset-defined FP state), `pc` and
+    /// `fcsr` zeroed. The loader overwrites `pc`/`regs[2]` (sp) after this.
     pub fn new(tid: u64) -> Self {
         Hart {
             regs: [0; 32],
@@ -153,6 +164,9 @@ pub struct CodeCache {
 }
 
 impl CodeCache {
+    /// Empty cache: no pages decoded yet, TLB slots all tagged `u64::MAX`
+    /// (never a valid page index) so the first lookup for any page is
+    /// guaranteed to miss and fall through to `slot`'s slow path.
     pub fn new() -> Self {
         CodeCache {
             map: FxMap::default(),
@@ -161,12 +175,24 @@ impl CodeCache {
         }
     }
 
+    /// Discard every decoded instruction. Not spec behavior per se — this is
+    /// the correctness fix for a purely emulator-internal optimization: if
+    /// the guest `munmap`s or `mmap`s over a file-backed (i.e. possibly
+    /// executable) region, any previously cached decode of that address
+    /// range is stale and must not be reused (see the `munmap`/`mmap`
+    /// syscall handlers in `sys.rs`, which call this exactly when that can
+    /// happen).
     pub fn clear(&mut self) {
         self.map.clear();
         self.arena.clear();
         self.tlb = [(u64::MAX, 0); 64];
     }
 
+    /// Map a 4 KiB page index to its arena slot of predecoded instructions,
+    /// allocating a fresh (all-`INVALID`) slot on first sight. A tiny
+    /// direct-mapped TLB (`tlb`) short-circuits the common case of staying
+    /// on the same page across consecutive instructions — pure performance,
+    /// no ISA meaning; the page itself is not part of any RISC-V structure.
     #[inline]
     fn slot(&mut self, page: u64) -> u32 {
         let t = (page as usize) & 63;
@@ -188,6 +214,10 @@ impl CodeCache {
     }
 }
 
+/// Sign-extend the low `bits` bits of `v` to a full 64-bit value. Used for
+/// every immediate field the spec defines as sign-extended (I/S/B/U/J-type
+/// immediates in ch. "RV32I", and the compressed-immediate formats in ch.
+/// "C") — shift-left-then-arithmetic-shift-right is the standard trick.
 #[inline]
 fn sext(v: u64, bits: u32) -> u64 {
     let shift = 64 - bits;
@@ -196,7 +226,12 @@ fn sext(v: u64, bits: u32) -> u64 {
 
 // ---- decoding ----
 
-/// Decode the instruction at `pc`. Returns None on fetch fault.
+/// Decode the instruction at `pc`. Per spec ("Base Instruction-Length
+/// Encoding"), the low 2 bits of the first halfword distinguish a 16-bit
+/// compressed instruction (`!= 0b11`) from a 32-bit one, which is why only
+/// one halfword is fetched before that check — the second halfword is only
+/// read (and combined little-endian) once we know we need it. Returns Err
+/// on a fetch fault (unmapped page — surfaced to the caller as `Stop::Fault`).
 fn decode(mem: &mut Memory, pc: u64) -> Result<Decoded, MemFault> {
     let lo = u16::from_le_bytes(mem.load::<2>(pc)?);
     if lo & 3 != 3 {
@@ -207,6 +242,9 @@ fn decode(mem: &mut Memory, pc: u64) -> Result<Decoded, MemFault> {
     Ok(decode32(inst, pc))
 }
 
+/// Plain struct literal helper — exists only so every `decode32`/
+/// `decode_compressed` arm below reads as one line instead of a multi-line
+/// struct expression. No spec meaning of its own.
 fn dec(op_: u16, rd: usize, rs1: usize, rs2: usize, len: u8, imm: u64) -> Decoded {
     Decoded {
         op: op_,
@@ -218,10 +256,22 @@ fn dec(op_: u16, rd: usize, rs1: usize, rs2: usize, len: u8, imm: u64) -> Decode
     }
 }
 
+/// Mark a decoded instruction as "not one of the fast-dispatch cases" —
+/// stashes the raw word for `exec_slow` to re-decode. Used both for
+/// genuinely rare-but-legal encodings (AMO, FP, CSR, fences) and for
+/// anything the fast decoder doesn't recognize at all, which `exec_slow`
+/// then rejects as `Stop::Illegal` if it isn't legal either.
 fn slow(word: u32) -> Decoded {
     dec(op::SLOW, 0, 0, 0, 4, word as u64)
 }
 
+/// Decode one 32-bit instruction word per the RV32I/RV64I base opcode map
+/// (spec ch. "RV32/64G Instruction Set Listings") plus the M extension
+/// (opcodes 0x33/0x3B with `funct7 == 1`) and F/D loads/stores/CSR/ecall
+/// (opcodes 0x07/0x27/0x73). Every arm below picks out exactly the
+/// `opcode`/`funct3`/`funct7` combination the spec assigns to that
+/// instruction; anything not matched falls through to `slow` for `exec_slow`
+/// (AMO/FMADD/other FP ops) or is genuinely illegal.
 fn decode32(inst: u32, pc: u64) -> Decoded {
     let opcode = inst & 0x7F;
     let rd = ((inst >> 7) & 31) as usize;
@@ -404,6 +454,15 @@ fn decode32(inst: u32, pc: u64) -> Decoded {
     }
 }
 
+/// Decode one 16-bit compressed instruction per the C extension's quadrant
+/// table (spec ch. "C", `funct3`/quadrant `op` determine the format exactly
+/// as the three `CIW`/`CL`/`CS`/`CI`/`CR`/`CB`/`CJ` tables lay out). Every
+/// arm expands its compressed form to the *same* `op::` opcode its 32-bit
+/// equivalent decodes to (e.g. `c.addi` becomes plain `ADDI`), so `run`'s
+/// execution core never needs to know compressed forms exist at all — this
+/// is exactly how the spec defines C: as a lossless encoding of a subset of
+/// the base+M+F+D instructions, not a distinct instruction semantics.
+/// Reserved/all-zero encodings (illegal per spec) fall through to `slow`.
 fn decode_compressed(inst: u16, _pc: u64) -> Decoded {
     let o = inst & 3;
     let funct3 = (inst >> 13) & 7;
@@ -588,6 +647,12 @@ fn decode_compressed(inst: u16, _pc: u64) -> Decoded {
 
 // ---- float helpers (slow path) ----
 
+/// Un-NaN-box a 64-bit FP register into an f32 (spec ch. "F" /
+/// "NaN Boxing of Narrower Values", also required when D is present per ch.
+/// "D"): a legally-produced f32 value always has all upper 32 bits set to
+/// 1; anything else means a wider (or garbage) value was left there, which
+/// per spec must be treated as the canonical quiet NaN rather than
+/// reinterpreted as a float.
 #[inline]
 fn unbox_f32(v: u64) -> f32 {
     if v >> 32 == 0xFFFF_FFFF {
@@ -596,11 +661,19 @@ fn unbox_f32(v: u64) -> f32 {
         f32::from_bits(0x7FC0_0000)
     }
 }
+/// NaN-box an f32 result into the 64-bit register file, per the same
+/// spec rule `unbox_f32` reads back: upper 32 bits all-1s marks "this is a
+/// single-precision value," so a later D-extension op reading the same
+/// register can tell it's not a valid double.
 #[inline]
 fn box_f32(f: f32) -> u64 {
     0xFFFF_FFFF_0000_0000 | f.to_bits() as u64
 }
 
+/// `FMIN.D`: spec-defined min, which differs from IEEE-754/Rust's `f64::min`
+/// on two points the spec is explicit about — two NaNs produce the
+/// canonical quiet NaN (not either input), and `-0.0`/`+0.0` compare as
+/// `-0.0 < +0.0` (unlike default IEEE min, which treats them as equal).
 fn f_min64(a: f64, b: f64) -> f64 {
     if a.is_nan() && b.is_nan() {
         return f64::from_bits(0x7FF8_0000_0000_0000);
@@ -616,6 +689,8 @@ fn f_min64(a: f64, b: f64) -> f64 {
     }
     if a < b { a } else { b }
 }
+/// `FMAX.D`: same spec rule as `f_min64`, mirrored — signed zero picks
+/// `+0.0` over `-0.0`, both-NaN produces the canonical quiet NaN.
 fn f_max64(a: f64, b: f64) -> f64 {
     if a.is_nan() && b.is_nan() {
         return f64::from_bits(0x7FF8_0000_0000_0000);
@@ -631,6 +706,7 @@ fn f_max64(a: f64, b: f64) -> f64 {
     }
     if a > b { a } else { b }
 }
+/// `FMIN.S`: same spec rule as `f_min64`, at single precision.
 fn f_min32(a: f32, b: f32) -> f32 {
     if a.is_nan() && b.is_nan() {
         return f32::from_bits(0x7FC0_0000);
@@ -646,6 +722,7 @@ fn f_min32(a: f32, b: f32) -> f32 {
     }
     if a < b { a } else { b }
 }
+/// `FMAX.S`: same spec rule as `f_max64`, at single precision.
 fn f_max32(a: f32, b: f32) -> f32 {
     if a.is_nan() && b.is_nan() {
         return f32::from_bits(0x7FC0_0000);
@@ -662,6 +739,10 @@ fn f_max32(a: f32, b: f32) -> f32 {
     if a > b { a } else { b }
 }
 
+/// Apply an `FCVT.*` rounding mode (spec ch. "F", "Rounding Modes" — RNE/
+/// RTZ/RDN/RUP/RMM, encoding 7 = "use `frm`" instead of an explicit static
+/// mode). Only conversions honor this field at all — see the module doc's
+/// floating-point caveat for why arithmetic doesn't.
 fn round_f64(v: f64, rm: u32, frm: u32) -> f64 {
     let mode = if rm == 7 { frm } else { rm };
     match mode {
@@ -673,6 +754,7 @@ fn round_f64(v: f64, rm: u32, frm: u32) -> f64 {
         _ => libm::rint(v),
     }
 }
+/// Single-precision counterpart of `round_f64`.
 fn round_f32(v: f32, rm: u32, frm: u32) -> f32 {
     let mode = if rm == 7 { frm } else { rm };
     match mode {
@@ -685,6 +767,10 @@ fn round_f32(v: f32, rm: u32, frm: u32) -> f32 {
     }
 }
 
+/// `FCVT.*.{S,D}` float→int saturating conversion (spec ch. "F", the
+/// `FCVT` int-conversion rule): out-of-range and NaN inputs saturate to the
+/// destination type's max (NaN treated as "positive out of range" per
+/// spec), rather than wrapping or trapping.
 macro_rules! fcvt_to_int {
     ($v:expr, $ty:ty, $min:expr, $max:expr) => {{
         let v = $v;
@@ -700,6 +786,10 @@ macro_rules! fcvt_to_int {
     }};
 }
 
+/// `FCLASS.D`: the spec's 10-category bitmask (ch. "F", "FCLASS
+/// Instruction" table — bit 0 -inf .. bit 9 quiet NaN). The mantissa MSB
+/// distinguishes quiet (bit set) from signaling (bit clear) NaN, which is
+/// the one category IEEE-754 alone doesn't give you directly.
 fn fclass64(v: f64) -> u64 {
     let bits = v.to_bits();
     let sign = bits >> 63 == 1;
@@ -721,6 +811,8 @@ fn fclass64(v: f64) -> u64 {
         1 << 6
     }
 }
+/// `FCLASS.S`: same spec table as `fclass64`, single precision (mantissa
+/// MSB at bit 22 instead of bit 51 distinguishes quiet/signaling NaN).
 fn fclass32(v: f32) -> u64 {
     let bits = v.to_bits();
     let sign = bits >> 31 == 1;
@@ -745,7 +837,20 @@ fn fclass32(v: f32) -> u64 {
 
 // ---- main interpreter ----
 
-/// Run `hart` until budget exhausted or a trap. Returns (stop, executed).
+/// The instruction-retirement loop: fetch (from `cache`, decoding on a
+/// cache miss), execute, repeat, until `budget` instructions have retired or
+/// a trap-equivalent condition (`ecall`/`ebreak`/illegal/fault) stops
+/// early — this function *is* "hart execution" per the unprivileged spec's
+/// operational model of fetch-decode-execute-retire, minus the M-mode/S-mode
+/// trap vectoring a real CPU would do (there is nowhere to vector to; see
+/// the crate doc's note on why this interpreter has no privileged state).
+/// Arms below are grouped by spec chapter with `----` divider comments; the
+/// grouping is purely for a reader — Rust's `match` doesn't care about arm
+/// order, and correctness never depends on it. Every arm ends by writing
+/// `hart.pc` explicitly (either `pc + len` for fallthrough, or a computed
+/// target for control flow), which is deliberate: it makes "did this
+/// instruction advance the PC correctly" a local, per-arm property to
+/// audit rather than something threaded implicitly through the loop.
 pub fn run(hart: &mut Hart, mem: &mut Memory, cache: &mut CodeCache, budget: u64) -> (Stop, u64) {
     let mut executed: u64 = 0;
 
@@ -802,6 +907,11 @@ pub fn run(hart: &mut Hart, mem: &mut Memory, cache: &mut CodeCache, budget: u64
         }
 
         match d.op {
+            // ---- RV64I base (spec ch. "RV32I"/"RV64I"): ADDI plus the
+            // doubleword/word load-store pair. The remaining RV64I
+            // loads/stores, ALU-immediate, and register-register ops are
+            // further down — arm order here is arbitrary, not grouped by
+            // category throughout (see the `run` doc above). ----
             op::ADDI => {
                 wr!(x1.wrapping_add(imm));
                 hart.pc = pc + d.len as u64;
@@ -824,6 +934,10 @@ pub fn run(hart: &mut Hart, mem: &mut Memory, cache: &mut CodeCache, budget: u64
                 fault!(mem.sw(x1.wrapping_add(imm), x2 as u32));
                 hart.pc = pc + d.len as u64;
             }
+            // ---- RV64I: conditional branches. `imm` was resolved to an
+            // absolute target address at decode time (`decode32`/
+            // `decode_compressed`), so execution is just "pick target or
+            // fallthrough" — no relative-offset arithmetic happens here. ----
             op::BEQ => {
                 hart.pc = if x1 == x2 { imm } else { pc + d.len as u64 };
             }
@@ -850,6 +964,11 @@ pub fn run(hart: &mut Hart, mem: &mut Memory, cache: &mut CodeCache, budget: u64
             op::BGEU => {
                 hart.pc = if x1 >= x2 { imm } else { pc + d.len as u64 };
             }
+            // ---- RV64I: unconditional jumps. Both write the link register
+            // (return address) before changing `pc`, matching the spec's
+            // "rd = pc+len" definition for JAL/JALR; JALR additionally
+            // clears bit 0 of the target per spec (the LSB of the computed
+            // address is ignored, not an alignment requirement violation). ----
             op::JAL => {
                 wr!(pc + d.len as u64);
                 hart.pc = imm;
@@ -859,10 +978,18 @@ pub fn run(hart: &mut Hart, mem: &mut Memory, cache: &mut CodeCache, budget: u64
                 wr!(pc + d.len as u64);
                 hart.pc = target;
             }
+            // LUI: `imm` already holds the final value at decode time — for
+            // `LUI` that's `imm << 12` sign-extended, and `decode32` also
+            // resolves AUIPC (opcode 0x17) into this same op by
+            // precomputing `pc + (imm << 12)`, since both instructions are
+            // "write a computed 64-bit constant to rd."
             op::LUI => {
                 wr!(imm);
                 hart.pc = pc + d.len as u64;
             }
+            // ---- RV64I: register-register ADD/SUB (the rest of this
+            // group — SLL..AND — is further down, after the immediate-ALU
+            // and shift groups). ----
             op::ADD => {
                 wr!(x1.wrapping_add(x2));
                 hart.pc = pc + d.len as u64;
@@ -871,6 +998,8 @@ pub fn run(hart: &mut Hart, mem: &mut Memory, cache: &mut CodeCache, budget: u64
                 wr!(x1.wrapping_sub(x2));
                 hart.pc = pc + d.len as u64;
             }
+            // ---- RV64I: the remaining loads/stores (byte/halfword, plus
+            // LWU) not covered in the first group above. ----
             op::LB => {
                 let v = fault!(mem.lb(x1.wrapping_add(imm)));
                 wr!(v as u64);
@@ -904,6 +1033,12 @@ pub fn run(hart: &mut Hart, mem: &mut Memory, cache: &mut CodeCache, budget: u64
                 fault!(mem.sh(x1.wrapping_add(imm), x2 as u16));
                 hart.pc = pc + d.len as u64;
             }
+            // ---- RV64I: register-immediate ALU (SLTI..ANDI). SLTI/SLTIU
+            // compare as signed/unsigned per spec; note SLTIU's immediate
+            // is still sign-extended at decode before the unsigned compare,
+            // matching the spec's explicit "SLTIU" rule (compare unsigned,
+            // but the 12-bit immediate is still sign-extended to XLEN
+            // first). ----
             op::SLTI => {
                 wr!(((x1 as i64) < (imm as i64)) as u64);
                 hart.pc = pc + d.len as u64;
@@ -924,6 +1059,12 @@ pub fn run(hart: &mut Hart, mem: &mut Memory, cache: &mut CodeCache, budget: u64
                 wr!(x1 & imm);
                 hart.pc = pc + d.len as u64;
             }
+            // ---- RV64I: immediate shifts. `imm` already holds the
+            // 6-bit shift amount extracted at decode time (`shamt6` in
+            // `decode32`) — RV64I widens the shift-amount field to 6 bits
+            // (vs RV32I's 5) precisely to allow shifting a full 64-bit
+            // register, which is why SLLI/SRLI/SRAI need no masking here
+            // (decode already bounded it to 0..63). ----
             op::SLLI => {
                 wr!(x1 << imm);
                 hart.pc = pc + d.len as u64;
@@ -936,6 +1077,11 @@ pub fn run(hart: &mut Hart, mem: &mut Memory, cache: &mut CodeCache, budget: u64
                 wr!(((x1 as i64) >> imm) as u64);
                 hart.pc = pc + d.len as u64;
             }
+            // ---- RV64I "*W" forms (spec ch. "RV64I", "Word" instructions):
+            // RV64-only ops that compute a 32-bit result and sign-extend it
+            // to 64 bits, letting 32-bit C/Rust code run correctly on a
+            // 64-bit register file. `sext(..., 32)` here is exactly that
+            // sign-extension step. ----
             op::ADDIW => {
                 wr!(sext(x1.wrapping_add(imm) & 0xFFFF_FFFF, 32));
                 hart.pc = pc + d.len as u64;
@@ -952,6 +1098,10 @@ pub fn run(hart: &mut Hart, mem: &mut Memory, cache: &mut CodeCache, budget: u64
                 wr!(((x1 as i32) >> imm) as i64 as u64);
                 hart.pc = pc + d.len as u64;
             }
+            // ---- RV64I: the rest of register-register ALU (ADD/SUB were
+            // above, near LUI). Shift amounts mask to 6 bits (`x2 & 63`)
+            // per spec — only the low log2(XLEN) bits of rs2 are used as
+            // the shift amount, the rest is architecturally ignored. ----
             op::SLL => {
                 wr!(x1 << (x2 & 63));
                 hart.pc = pc + d.len as u64;
@@ -984,6 +1134,10 @@ pub fn run(hart: &mut Hart, mem: &mut Memory, cache: &mut CodeCache, budget: u64
                 wr!(x1 & x2);
                 hart.pc = pc + d.len as u64;
             }
+            // ---- RV64I: register-register "*W" forms — same 32-bit-then-
+            // sign-extend rule as the immediate "*W" group above, and same
+            // 5-bit (not 6-bit) shift mask as real RV64I SLLW/SRLW/SRAW
+            // (`x2 & 31`, since the result is only 32 bits wide). ----
             op::ADDW => {
                 wr!(sext((x1 as u32).wrapping_add(x2 as u32) as u64, 32));
                 hart.pc = pc + d.len as u64;
@@ -1004,6 +1158,16 @@ pub fn run(hart: &mut Hart, mem: &mut Memory, cache: &mut CodeCache, budget: u64
                 wr!(((x1 as i32) >> (x2 & 31)) as i64 as u64);
                 hart.pc = pc + d.len as u64;
             }
+            // ---- M extension (spec ch. "M"): multiply/divide/remainder,
+            // full XLEN and the "*W" 32-bit forms. `MULH*` computes the
+            // upper 64 bits of a full 128-bit product via i128/u128
+            // widening — the only way to get the spec-defined high half
+            // without a real widening multiplier. Division-by-zero and
+            // signed-overflow (`MIN / -1`) each follow the spec's explicit
+            // defined results below, never a trap: division by zero
+            // returns all-ones (`DIV`/`DIVU`) or the dividend unchanged
+            // (`REM`/`REMU`); `MIN / -1` returns the dividend (`DIV`) or
+            // zero (`REM`), since the true quotient doesn't fit. ----
             op::MUL => {
                 wr!(x1.wrapping_mul(x2));
                 hart.pc = pc + d.len as u64;
@@ -1050,6 +1214,8 @@ pub fn run(hart: &mut Hart, mem: &mut Memory, cache: &mut CodeCache, budget: u64
                 wr!(if x2 == 0 { x1 } else { x1 % x2 });
                 hart.pc = pc + d.len as u64;
             }
+            // M extension "*W" forms: same defined-not-trapped zero/overflow
+            // rules as above, computed at 32 bits then sign-extended.
             op::MULW => {
                 wr!(sext((x1 as u32).wrapping_mul(x2 as u32) as u64, 32));
                 hart.pc = pc + d.len as u64;
@@ -1094,6 +1260,13 @@ pub fn run(hart: &mut Hart, mem: &mut Memory, cache: &mut CodeCache, budget: u64
                 wr!(r as i32 as i64 as u64);
                 hart.pc = pc + d.len as u64;
             }
+            // ---- F/D extensions: floating-point loads/stores (spec ch.
+            // "F"/"D"). `FLW` NaN-boxes the loaded 32 bits into the 64-bit
+            // FP register file on the way in (see `unbox_f32`'s doc for why
+            // that convention exists); `FLD` and the stores move the full
+            // 64 bits untouched, since a register already holding a NaN-
+            // boxed f32 stores back out exactly the bit pattern a real FSD
+            // would produce. ----
             op::FLW => {
                 let v = fault!(mem.lwu(x1.wrapping_add(imm)));
                 hart.fregs[rd] = 0xFFFF_FFFF_0000_0000 | v;
@@ -1111,16 +1284,35 @@ pub fn run(hart: &mut Hart, mem: &mut Memory, cache: &mut CodeCache, budget: u64
                 fault!(mem.sd(x1.wrapping_add(imm), hart.fregs[rs2]));
                 hart.pc = pc + d.len as u64;
             }
+            // FENCE/FENCE.I (opcode 0x0F, decoded to NOP in `decode32`):
+            // correct as a no-op specifically because there is only ever
+            // one hart executing at once and no separate instruction cache
+            // to invalidate beyond `CodeCache` (which the syscall layer
+            // clears explicitly whenever memory content could change under
+            // it — see `CodeCache::clear`'s doc) — so there is nothing for
+            // an ordering/sync fence to actually order here.
             op::NOP => {
                 hart.pc = pc + d.len as u64;
             }
+            // ECALL: the sole way a guest requests a Linux syscall (spec
+            // ch. "Zicsr/environment calls" — riscv64 has no separate
+            // "syscall" instruction). Advances `pc` *before* returning so
+            // the syscall layer resumes just after the ecall, matching the
+            // real ABI convention that a syscall doesn't restart itself.
             op::ECALL => {
                 hart.pc = pc + d.len as u64;
                 return (Stop::Ecall, executed);
             }
+            // EBREAK: spec-defined breakpoint trap. This interpreter has no
+            // debugger to trap to, so it's surfaced to the host as a hard
+            // stop rather than silently ignored or advancing past it.
             op::EBREAK => {
                 return (Stop::Ebreak { pc }, executed);
             }
+            // Anything `decode` couldn't fast-path (AMO, CSR, FP arithmetic/
+            // FMADD, or truly unrecognized bits) — re-decode the raw word
+            // in `exec_slow`, which is also where genuinely illegal
+            // encodings finally get rejected.
             op::SLOW => {
                 let word = imm as u32;
                 match exec_slow(hart, mem, word, executed) {
@@ -1128,6 +1320,10 @@ pub fn run(hart: &mut Hart, mem: &mut Memory, cache: &mut CodeCache, budget: u64
                     Err(stop) => return (stop, executed),
                 }
             }
+            // Reserved/never-produced-by-decode opcode value: unreachable
+            // in practice (every `op::` constant above is handled), kept as
+            // a safety net rather than `unreachable!()` so a future decoder
+            // bug surfaces as a clean `Stop::Illegal` instead of a panic.
             _ => {
                 return (
                     Stop::Illegal {
@@ -1143,7 +1339,17 @@ pub fn run(hart: &mut Hart, mem: &mut Memory, cache: &mut CodeCache, budget: u64
     (Stop::Budget, executed)
 }
 
-/// Execute a rare instruction from its raw 32-bit word. Advances pc.
+/// Re-decodes and executes one instruction the fast path couldn't handle:
+/// AMO (A extension, opcode 0x2F), CSR access (Zicsr, opcode 0x73),
+/// fused-multiply-add (F/D, opcodes 0x43/0x47/0x4B/0x4F), and the rest of
+/// F/D arithmetic (opcode 0x53). Dispatch is by raw `opcode` here rather
+/// than the pretokenized `Decoded` form `run` uses, because these need more
+/// decode fields (funct7, rs3, rounding mode) than `Decoded` has room for —
+/// a deliberate trade-off of decode cost against memory footprint, since
+/// these opcodes are rare in practice (real programs are overwhelmingly
+/// base-ALU/load-store/branch instructions). Always advances `pc` by 4 on
+/// success (none of these have a compressed 2-byte form) or returns the
+/// `Stop` a fault/illegal encoding should produce.
 fn exec_slow(hart: &mut Hart, mem: &mut Memory, inst: u32, executed: u64) -> Result<(), Stop> {
     let pc = hart.pc;
     let opcode = inst & 0x7F;
@@ -1178,8 +1384,18 @@ fn exec_slow(hart: &mut Hart, mem: &mut Memory, inst: u32, executed: u64) -> Res
     }
 
     match opcode {
+        // A extension (spec ch. "A"): LR/SC (aop 0x02/0x03) plus the 9 AMO
+        // read-modify-write ops, word (`width == 2`) or doubleword. The
+        // LR/SC reservation (`hart.reservation`) is a single `Option<u64>`
+        // rather than a real reservation-set data structure because only
+        // one hart ever executes at a time (see the crate/lib.rs docs on
+        // concurrency) — nothing can invalidate a reservation "behind its
+        // back" except this hart's own next SC or a timeslice rotation,
+        // and `Machine::run_reporting` clears it on every rotation
+        // (`Stop::Budget` arm in `lib.rs`), which is exactly the spec's
+        // permitted "invalidate on any event that might indicate progress
+        // by another hart" rule, applied conservatively.
         0x2F => {
-            // AMO
             let width = funct3;
             let aop = funct7 >> 2;
             let addr = x1;
@@ -1252,8 +1468,21 @@ fn exec_slow(hart: &mut Hart, mem: &mut Memory, inst: u32, executed: u64) -> Res
             }
             hart.pc += 4;
         }
+        // Zicsr (spec ch. "Zicsr"; ecall/ebreak share this opcode but are
+        // handled in the fast path via `funct3 == 0`, never reaching here).
+        // `funct3` selects CSRRW/CSRRS/CSRRC (register source) vs their `I`
+        // immediate-source variants (`funct3 >= 5` uses `rs1` itself as a
+        // 5-bit zero-extended immediate, per spec) — bit 0 of `funct3 & 3`
+        // distinguishes "write" (RW) from "set/clear against old value"
+        // (RS/RC), and RS/RC additionally skip the write entirely when
+        // `rs1 == x0` (spec: "shall not cause any side effects" when the
+        // source is x0, since ORing/ANDing with an all-zero mask changes
+        // nothing to set/clear anyway). Only `fflags`/`frm`/`fcsr` and the
+        // three read-only counters are backed by real state — every other
+        // CSR number reads as 0 and silently no-ops on write rather than
+        // trapping (see SPEC.md's CSR caveat: this is the most significant
+        // ISA deviation in this interpreter).
         0x73 => {
-            // CSR (ecall/ebreak handled in fast path)
             let csr = (inst >> 20) as u16;
             let zimm = rs1 as u64;
             let old = match csr {
@@ -1286,8 +1515,18 @@ fn exec_slow(hart: &mut Hart, mem: &mut Memory, inst: u32, executed: u64) -> Res
             wr!(old);
             hart.pc += 4;
         }
+        // F/D fused multiply-add family (spec ch. "F"/"D": FMADD/FMSUB/
+        // FNMSUB/FNMADD, one opcode per sign combination on the product and
+        // addend — the four opcodes here map 1:1 to those four spec
+        // mnemonics). `fmt` (bits 25-26 of the instruction, the spec's
+        // `fmt` field) selects single (0) vs double precision; `rs3` is the
+        // three-operand form's third source register, a field that only
+        // exists for this instruction family (hence needing `exec_slow`'s
+        // raw-word re-decode rather than the fast path's fixed rd/rs1/rs2
+        // shape). `libm::fma[f]` gives the single correctly-rounded
+        // (intermediate not rounded twice) result the spec requires, rather
+        // than a separate multiply-then-add.
         0x43 | 0x47 | 0x4B | 0x4F => {
-            // FMADD family
             let rs3 = (inst >> 27) as usize;
             let fmt = (inst >> 25) & 3;
             if fmt == 0 {
@@ -1317,6 +1556,19 @@ fn exec_slow(hart: &mut Hart, mem: &mut Memory, inst: u32, executed: u64) -> Res
             }
             hart.pc += 4;
         }
+        // The rest of F/D (spec ch. "F"/"D"): `funct7` alone (per the
+        // spec's opcode-map table) picks both the operation *and* precision
+        // — odd values (…01, …05, …09, …0D, …15, …21, …51, …61, …69, …71)
+        // are the double-precision twin of the even value right before it.
+        // Covers: arithmetic (add/sub/mul/div/sqrt, 0x00-0x2D), sign-inject
+        // FSGNJ/FSGNJN/FSGNJX (0x10/0x11, `rm` selects which of the three),
+        // FMIN/FMAX (0x14/0x15, `rm==0` picks min), single↔double FCVT
+        // (0x20/0x21), compare FEQ/FLT/FLE (0x50/0x51, `rm` selects which),
+        // float→int and int→float FCVT (0x60/0x61/0x68/0x69, `rs2` selects
+        // the integer type per spec — it's a static field here, not a real
+        // register), FCLASS/FMV.X.W (0x70/0x71, `rm` disambiguates since
+        // they share an opcode+funct7 and differ only in `rm`), and
+        // FMV.W.X/FMV.D.X (0x78/0x79, raw bit-pattern move, no conversion).
         0x53 => {
             let rm = funct3;
             let frm = ((hart.fcsr >> 5) & 7) as u32;

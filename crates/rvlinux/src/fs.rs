@@ -2,6 +2,14 @@
 //!
 //! Deterministic by construction: directory listings come from a BTreeMap so
 //! they are always sorted; there are no timestamps unless we invent them.
+//!
+//! This module has no RISC-V ISA content of its own — it implements enough
+//! of Linux's VFS/file-descriptor model (paths, symlinks, directories,
+//! pipes, fd table) for `sys.rs`'s syscall handlers to sit on top of. See
+//! `../SPEC.md`'s syscall coverage table for which filesystem syscalls are
+//! implemented and which deliberately aren't (e.g. no real permission
+//! enforcement — `add_file`/`create_file`'s `mode` is stored and returned by
+//! `stat` but never checked against an access request).
 
 use alloc::collections::BTreeMap;
 use alloc::collections::VecDeque;
@@ -16,18 +24,27 @@ pub enum FileData {
 }
 
 impl FileData {
+    /// Byte length regardless of which variant is holding the data.
     pub fn len(&self) -> u64 {
         match self {
             FileData::Ro(d) => d.len() as u64,
             FileData::Rw(d) => d.len() as u64,
         }
     }
+    /// Borrow the contents regardless of variant — the read path never
+    /// needs to know whether a file started as bundle-provided (`Ro`) or
+    /// was created/written by the guest (`Rw`).
     pub fn bytes(&self) -> &[u8] {
         match self {
             FileData::Ro(d) => d,
             FileData::Rw(d) => d,
         }
     }
+    /// Copy-on-write upgrade: a file that started as a shared, `Arc`-backed
+    /// read-only blob (e.g. straight from the toolchain bundle) becomes its
+    /// own private, mutable `Vec` the first time anything writes to it —
+    /// so writing to one open file never mutates the shared bundle data
+    /// other, unrelated file handles might still be referencing.
     fn make_rw(&mut self) -> &mut Vec<u8> {
         if let FileData::Ro(d) = self {
             *self = FileData::Rw(d.as_ref().clone());
@@ -37,7 +54,10 @@ impl FileData {
             _ => unreachable!(),
         }
     }
-    /// Arc snapshot for mmap backing.
+    /// Arc snapshot for mmap backing — `Memory::map`'s `Backing::File`
+    /// holds an `Arc<Vec<u8>>` so a file-backed mapping keeps working even
+    /// if the file is later modified or removed from the fs (matching
+    /// Linux's "the mapping outlives an unlink" semantics).
     pub fn snapshot(&self) -> Arc<Vec<u8>> {
         match self {
             FileData::Ro(d) => d.clone(),
@@ -103,6 +123,8 @@ pub fn normalize(cwd: &str, path: &str) -> String {
     out
 }
 
+/// The directory component of `path` (everything before the last `/`) —
+/// used to find/create a new node's parent directory.
 fn parent_of(path: &str) -> String {
     match path.rfind('/') {
         Some(0) => "/".to_string(),
@@ -112,6 +134,9 @@ fn parent_of(path: &str) -> String {
 }
 
 impl Fs {
+    /// Empty filesystem: just the implicit root — everything else (the
+    /// toolchain bundle, workspace source tree, `/proc`/`/tmp` stubs) is
+    /// added afterward via `bundle::parse_into` and `add_file`/`mkdir_all`.
     pub fn new() -> Self {
         Fs {
             nodes: BTreeMap::new(),
@@ -120,6 +145,12 @@ impl Fs {
         }
     }
 
+    /// Assign (or recall) a stable inode number for `path` — Linux `stat`
+    /// callers expect distinct files to have distinct, *stable-within-a-run*
+    /// inode numbers (some build tools compare them for hardlink/identity
+    /// detection); numbering starts at 100 and increases monotonically per
+    /// first-seen path, so it's a pure function of access order, not real
+    /// filesystem allocation.
     pub fn ino(&mut self, path: &str) -> u64 {
         if let Some(&i) = self.inos.get(path) {
             return i;
@@ -130,6 +161,9 @@ impl Fs {
         i
     }
 
+    /// `mkdir -p` — create every path component that doesn't already exist
+    /// as a directory (existing entries, of any kind, are left untouched
+    /// via `or_insert`).
     pub fn mkdir_all(&mut self, path: &str) {
         let norm = normalize("/", path);
         let mut cur = String::new();
@@ -140,6 +174,11 @@ impl Fs {
         }
     }
 
+    /// Install a read-only file at `path`, creating parent directories as
+    /// needed. This is the bulk-loading path (`bundle::parse_into` calls it
+    /// for every file in the packed toolchain/source tree) — `Ro` since
+    /// bundle content should never need copying until something actually
+    /// writes to it (see `FileData::make_rw`).
     pub fn add_file(&mut self, path: &str, data: Vec<u8>, mode: u32) {
         let norm = normalize("/", path);
         self.mkdir_all(&parent_of(&norm));
@@ -152,6 +191,8 @@ impl Fs {
         );
     }
 
+    /// Install a symlink at `path` pointing at `target` (not resolved or
+    /// validated here — `resolve` is what follows it later).
     pub fn add_symlink(&mut self, path: &str, target: &str) {
         let norm = normalize("/", path);
         self.mkdir_all(&parent_of(&norm));
@@ -161,7 +202,10 @@ impl Fs {
     /// Resolve symlinks in all components of `path` (which must already be
     /// normalized absolute). Returns final normalized path (whose last
     /// component may or may not exist). If `follow_last` is false, a symlink
-    /// in the final component is not followed.
+    /// in the final component is not followed — this is exactly the
+    /// `AT_SYMLINK_NOFOLLOW`/`lstat`-vs-`stat` distinction Linux path
+    /// resolution makes. The 40-hop symlink-loop limit (`ELOOP`) matches
+    /// Linux's own `MAXSYMLINKS`, not an arbitrary choice.
     pub fn resolve(&self, path: &str, follow_last: bool) -> Result<String, i64> {
         let mut result = String::from("/");
         let comps: Vec<String> = path
@@ -217,6 +261,10 @@ impl Fs {
         Ok(result)
     }
 
+    /// Look up an already-`resolve`d path. `/` itself is special-cased since
+    /// the root directory is implicit (never actually stored as a `Node` in
+    /// `nodes`) — every other directory *does* get an explicit `Node::Dir`
+    /// entry via `mkdir_all`.
     pub fn get(&self, resolved: &str) -> Option<&Node> {
         if resolved == "/" {
             return Some(&Node::Dir);
@@ -224,6 +272,14 @@ impl Fs {
         self.nodes.get(resolved)
     }
 
+    /// `getdents64`'s data source: every direct child of `dir`, as
+    /// `(name, d_type)` pairs using the real Linux `DT_*` constants
+    /// (`DT_DIR`=4, `DT_REG`=8, `DT_LNK`=10) so callers can pass them
+    /// straight through to a `linux_dirent64` buffer. Walking a `BTreeMap`
+    /// range naturally yields entries in sorted order — this is also what
+    /// makes directory listings deterministic across runs, since a real
+    /// filesystem's readdir order is normally unspecified/insertion-order-
+    /// dependent.
     pub fn list_dir(&self, dir: &str) -> Vec<(String, u8)> {
         let prefix = if dir == "/" {
             String::from("/")
@@ -251,6 +307,11 @@ impl Fs {
         out
     }
 
+    /// `open(2)` with `O_CREAT`: makes a new, empty, writable file at an
+    /// already-resolved path, provided the parent directory actually
+    /// exists (`ENOENT` otherwise — matches Linux: you can't create a file
+    /// in a nonexistent directory) and nothing with that name is already a
+    /// directory (`EISDIR`).
     pub fn create_file(&mut self, resolved: &str, mode: u32) -> Result<(), i64> {
         if let Some(Node::Dir) = self.nodes.get(resolved) {
             return Err(EISDIR);
@@ -269,6 +330,12 @@ impl Fs {
         Ok(())
     }
 
+    /// `pwrite64`'s core: write `buf` at absolute offset `pos`, growing the
+    /// file (zero-filling any gap) if `pos + buf.len()` extends past the
+    /// current end — matching POSIX `pwrite`'s "writing past EOF extends
+    /// the file, with a hole read back as zero" behavior. Every write
+    /// syscall in `sys.rs` (`write`, `pwrite64`, append-mode `write_to_fd`,
+    /// ...) funnels through this.
     pub fn write_at(&mut self, resolved: &str, pos: u64, buf: &[u8]) -> Result<usize, i64> {
         match self.nodes.get_mut(resolved) {
             Some(Node::File { data, .. }) => {
@@ -285,6 +352,8 @@ impl Fs {
         }
     }
 
+    /// `ftruncate(2)`: resize a file in place, zero-filling on grow —
+    /// backs both the `ftruncate` syscall and `openat`'s `O_TRUNC` flag.
     pub fn truncate(&mut self, resolved: &str, len: u64) -> Result<(), i64> {
         match self.nodes.get_mut(resolved) {
             Some(Node::File { data, .. }) => {
@@ -329,6 +398,9 @@ pub struct FdTable {
 }
 
 impl FdTable {
+    /// Every process starts with exactly fds 0/1/2 = stdin/stdout/stderr
+    /// already open — the POSIX/Linux convention every C runtime assumes
+    /// without ever calling `open` for them.
     pub fn new() -> Self {
         FdTable {
             fds: alloc::vec![
@@ -340,6 +412,10 @@ impl FdTable {
         }
     }
 
+    /// Allocate the lowest-numbered free fd `>= min` (POSIX's mandated
+    /// "lowest available" allocation policy — required by `dup2`/`F_DUPFD`
+    /// callers, and by plain `open` returning predictable fd numbers),
+    /// growing the table if every existing slot at/above `min` is taken.
     pub fn alloc(&mut self, fd: Fd, min: usize) -> i64 {
         for i in min..self.fds.len() {
             if self.fds[i].is_none() {
@@ -354,6 +430,9 @@ impl FdTable {
         (self.fds.len() - 1) as i64
     }
 
+    /// Look up an open fd — negative fds (and anything past the table end
+    /// or already closed) return `None`, becoming `EBADF` at the syscall
+    /// layer, matching Linux's rejection of negative fd numbers.
     pub fn get(&self, fd: i64) -> Option<&Fd> {
         if fd < 0 {
             return None;
@@ -361,6 +440,8 @@ impl FdTable {
         self.fds.get(fd as usize)?.as_ref()
     }
 
+    /// Mutable counterpart of `get`, for handlers that update fd state in
+    /// place (e.g. advancing a file's read/write position).
     pub fn get_mut(&mut self, fd: i64) -> Option<&mut Fd> {
         if fd < 0 {
             return None;
@@ -368,6 +449,11 @@ impl FdTable {
         self.fds.get_mut(fd as usize)?.as_mut()
     }
 
+    /// `close(2)`: frees the fd slot and, for a pipe end, decrements the
+    /// pipe's reader/writer count — that count is what lets a pipe reader
+    /// see EOF once every writer has closed (checked in `sys_read`), the
+    /// same "last writer closing signals EOF" contract real Linux pipes
+    /// have.
     pub fn close(&mut self, fd: i64) -> Result<Fd, i64> {
         if fd < 0 || fd as usize >= self.fds.len() {
             return Err(EBADF);
