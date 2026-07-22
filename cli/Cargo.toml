@@ -17,7 +17,10 @@ serde_json    = { workspace = true }
 hex           = { workspace = true, features = ["std"] }
 clap          = { workspace = true }
 
-# Host-side enclave loader (the same crates ftxsgx-runner uses internally)
+# Host-side enclave loader (the same crates ftxsgx-runner uses internally).
+# Only buildable on x86_64 Linux; on other platforms the CLI still compiles
+# and offers the --native dry-run path.
+[target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dependencies]
 enclave-runner     = "0.8"
 enclave-runner-sgx = "0.1"
 sgxs-loaders       = "0.5"

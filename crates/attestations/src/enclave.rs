@@ -29,11 +29,20 @@ fn platform_seal_and_mrenclave() -> ([u8; 32], [u8; 16]) {
     (mrenclave, seal16)
 }
 
+/// Dry run (no SGX): measure the running binary in place of MRENCLAVE so each
+/// program still gets a distinct, deterministic identity, and derive a
+/// stand-in for the CPU seal secret from that measurement. No hardware root
+/// of trust — anyone can recompute this identity.
 #[cfg(not(target_env = "sgx"))]
 fn platform_seal_and_mrenclave() -> ([u8; 32], [u8; 16]) {
-    let mr = sha256(b"non-sgx-stub-mrenclave");
+    let exe = std::env::current_exe().expect("current_exe");
+    let bytes = std::fs::read(&exe).expect("read current exe");
+    let mr = sha256(&bytes);
+    let mut buf = Vec::with_capacity(18 + 32);
+    buf.extend_from_slice(b"non-sgx-stub-seal/");
+    buf.extend_from_slice(&mr);
     let mut seal = [0u8; 16];
-    seal.copy_from_slice(&sha256(b"non-sgx-stub-seal")[..16]);
+    seal.copy_from_slice(&sha256(&buf)[..16]);
     (mr, seal)
 }
 

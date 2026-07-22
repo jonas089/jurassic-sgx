@@ -55,8 +55,10 @@ cli/                      one host-side binary (`sgx-attest`):
 ## Quickstart
 
 ```bash
-make demo            # build, enroll, publish, run fib(20), verify
-make tamper-test     # mutate output, confirm verifier rejects
+make demo                 # build, enroll, publish, run fib(20), verify
+make dry-run fibonacci    # same pipeline without SGX (works on macOS), stub identity
+make dry-run hello-rustc  # dry-run the verifiable-compilation example
+make tamper-test          # mutate output, confirm verifier rejects
 make run N=42        # compute fib(42), write envelope.json
 make verify          # external verification of envelope.json
 ```
@@ -68,6 +70,21 @@ sgx-attest enroll  --sgxs path/to/fibonacci.sgxs
 sgx-attest publish
 sgx-attest run     --sgxs path/to/fibonacci.sgxs --out envelope.json -- 20
 sgx-attest verify  --registry registry.json --envelope envelope.json
+```
+
+## Dry run (no SGX, any platform)
+
+Every subcommand that takes `--sgxs` also accepts `--native <binary>` instead:
+the program runs as an ordinary process using a stub MRENCLAVE/seal key
+(`attestations` substitutes it when not compiled for `target_env = "sgx"`).
+The full enroll → publish → run → verify pipeline works, so you can develop
+and test programs on a machine without SGX (e.g. a Mac); it just proves
+nothing about hardware. The SGX loader dependencies are only pulled in on
+x86_64 Linux, so the workspace compiles everywhere.
+
+```bash
+cargo build --release -p fibonacci        # native host build
+sgx-attest demo --native target/release/fibonacci --n 20
 ```
 
 ## Caveats

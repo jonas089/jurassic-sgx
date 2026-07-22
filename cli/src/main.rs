@@ -4,21 +4,17 @@
 //! `run` and `enroll` load and execute the enclave from this process directly
 //! via the `enclave-runner` + `sgxs-loaders` + `aesm-client` crates — no
 //! `ftxsgx-runner` shellout required.
+//!
+//! On non-SGX platforms (e.g. macOS) pass `--native <binary>` instead of
+//! `--sgxs`: the program runs as an ordinary process with a stub identity
+//! (dry run — no hardware root of trust, but the full pipeline works).
 
-use std::io::Read;
-use std::os::unix::io::FromRawFd;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
-use std::thread;
 
-use aesm_client::AesmClient;
 use attestations::core::{Envelope, Leaf, Mrenclave, PubKey};
 use attestations::registry::Registry;
 use attestations::verify::verify_envelope;
 use clap::{Parser, Subcommand};
-use enclave_runner::EnclaveBuilder;
-use enclave_runner_sgx::EnclaveBuilder as EnclaveBuilderSgx;
-use sgxs_loaders::isgx::Device as IsgxDevice;
 
 #[derive(Parser, Debug)]
 #[command(name = "sgx-attest", about = "SGX attestation pipeline (Merkle-rooted)")]
@@ -32,8 +28,11 @@ enum Cmd {
     /// Run the enclave in `enroll` mode and append the leaf to a registry file.
     Enroll {
         /// Path to the .sgxs enclave image.
+        #[arg(long, conflicts_with = "native")]
+        sgxs: Option<PathBuf>,
+        /// Dry run: path to a native binary, executed without SGX.
         #[arg(long)]
-        sgxs: PathBuf,
+        native: Option<PathBuf>,
         /// Registry JSON to update (created if missing).
         #[arg(long, default_value = "registry.json")]
         registry: PathBuf,
@@ -45,8 +44,11 @@ enum Cmd {
     },
     /// Run the enclave in `compute` mode with the given args; write the envelope.
     Run {
+        #[arg(long, conflicts_with = "native")]
+        sgxs: Option<PathBuf>,
+        /// Dry run: path to a native binary, executed without SGX.
         #[arg(long)]
-        sgxs: PathBuf,
+        native: Option<PathBuf>,
         /// Output file for the JSON Envelope.
         #[arg(long, default_value = "envelope.json")]
         out: PathBuf,
@@ -63,8 +65,11 @@ enum Cmd {
     },
     /// End-to-end smoke test: enroll, publish, run with N, verify.
     Demo {
+        #[arg(long, conflicts_with = "native")]
+        sgxs: Option<PathBuf>,
+        /// Dry run: path to a native binary, executed without SGX.
         #[arg(long)]
-        sgxs: PathBuf,
+        native: Option<PathBuf>,
         /// Fibonacci index to compute.
         #[arg(long, default_value_t = 20)]
         n: u64,
@@ -82,16 +87,68 @@ enum Cmd {
     },
 }
 
+/// What to execute: a real SGX enclave image, or a native binary (dry run).
+enum Target {
+    Sgxs(PathBuf),
+    Native(PathBuf),
+}
+
+fn resolve_target(sgxs: Option<PathBuf>, native: Option<PathBuf>) -> Target {
+    match (sgxs, native) {
+        (Some(s), None) => Target::Sgxs(s),
+        (None, Some(n)) => {
+            eprintln!("[dry-run] executing {} natively — stub identity, no hardware root of trust", n.display());
+            Target::Native(n)
+        }
+        _ => {
+            eprintln!("pass --sgxs <image.sgxs> (SGX) or --native <binary> (dry run, no SGX)");
+            std::process::exit(2);
+        }
+    }
+}
+
 fn main() {
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::Enroll { sgxs, registry } => cmd_enroll(&sgxs, &registry),
+        Cmd::Enroll { sgxs, native, registry } => cmd_enroll(&resolve_target(sgxs, native), &registry),
         Cmd::Publish { registry } => cmd_publish(&registry),
-        Cmd::Run { sgxs, out, enclave_args } => cmd_run(&sgxs, &out, &enclave_args),
+        Cmd::Run { sgxs, native, out, enclave_args } => cmd_run(&resolve_target(sgxs, native), &out, &enclave_args),
         Cmd::Verify { registry, envelope } => cmd_verify(&registry, &envelope),
-        Cmd::Demo { sgxs, n, registry, envelope } => cmd_demo(&sgxs, n, &registry, &envelope),
+        Cmd::Demo { sgxs, native, n, registry, envelope } => cmd_demo(&resolve_target(sgxs, native), n, &registry, &envelope),
         Cmd::TamperTest { registry, envelope } => cmd_tamper_test(&registry, &envelope),
     }
+}
+
+fn run_program_capturing(target: &Target, args: &[String]) -> Vec<u8> {
+    match target {
+        Target::Sgxs(sgxs) => run_enclave_capturing(sgxs, args),
+        Target::Native(bin) => run_native_capturing(bin, args),
+    }
+}
+
+/// Dry run: execute the program as an ordinary child process and capture its
+/// stdout. The `attestations` crate substitutes a stub MRENCLAVE/seal key when
+/// not compiled for `target_env = "sgx"`, so the whole pipeline works — it
+/// just proves nothing about hardware.
+fn run_native_capturing(bin: &PathBuf, args: &[String]) -> Vec<u8> {
+    let out = std::process::Command::new(bin).args(args).output().unwrap_or_else(|e| {
+        eprintln!("failed to execute {}: {}", bin.display(), e);
+        std::process::exit(1);
+    });
+    if !out.stderr.is_empty() {
+        eprint!("{}", String::from_utf8_lossy(&out.stderr));
+    }
+    if !out.status.success() {
+        eprintln!("native program exited with {}", out.status);
+        std::process::exit(1);
+    }
+    out.stdout
+}
+
+#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+fn run_enclave_capturing(_sgxs: &PathBuf, _args: &[String]) -> Vec<u8> {
+    eprintln!("--sgxs requires x86_64 Linux with an SGX driver; on this platform use --native <binary> for a dry run");
+    std::process::exit(2);
 }
 
 /// Capture the enclave's stdout into a Vec<u8>:
@@ -102,8 +159,17 @@ fn main() {
 /// 5. run the enclave (its `println!`s land in the pipe)
 /// 6. flush, restore fd 1, close write end → reader thread sees EOF
 /// 7. join reader, return buffer
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 fn run_enclave_capturing(sgxs: &PathBuf, args: &[String]) -> Vec<u8> {
-    use std::io::Write as _;
+    use std::io::{Read, Write as _};
+    use std::os::unix::io::FromRawFd;
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+
+    use aesm_client::AesmClient;
+    use enclave_runner::EnclaveBuilder;
+    use enclave_runner_sgx::EnclaveBuilder as EnclaveBuilderSgx;
+    use sgxs_loaders::isgx::Device as IsgxDevice;
 
     // Build runner.
     let aesm = AesmClient::new();
@@ -160,8 +226,8 @@ fn run_enclave_capturing(sgxs: &PathBuf, args: &[String]) -> Vec<u8> {
     Arc::try_unwrap(captured).unwrap().into_inner().unwrap()
 }
 
-fn cmd_enroll(sgxs: &PathBuf, registry_path: &PathBuf) {
-    let raw = run_enclave_capturing(sgxs, &["enroll".to_string()]);
+fn cmd_enroll(target: &Target, registry_path: &PathBuf) {
+    let raw = run_program_capturing(target, &["enroll".to_string()]);
     let s = std::str::from_utf8(&raw).expect("enrollment proof not utf8");
     let proof: serde_json::Value = serde_json::from_str(s.trim()).expect("parse proof");
 
@@ -216,25 +282,25 @@ fn cmd_publish(registry_path: &PathBuf) {
     println!("wrote {}", dst.display());
 }
 
-fn cmd_run(sgxs: &PathBuf, out: &PathBuf, enclave_args: &[String]) {
+fn cmd_run(target: &Target, out: &PathBuf, enclave_args: &[String]) {
     let mut full_args = vec!["compute".to_string()];
     full_args.extend(enclave_args.iter().cloned());
-    let raw = run_enclave_capturing(sgxs, &full_args);
+    let raw = run_program_capturing(target, &full_args);
     std::fs::write(out, &raw).unwrap();
     println!("wrote {} ({} bytes)", out.display(), raw.len());
 }
 
-fn cmd_demo(sgxs: &PathBuf, n: u64, registry: &PathBuf, envelope: &PathBuf) {
+fn cmd_demo(target: &Target, n: u64, registry: &PathBuf, envelope: &PathBuf) {
     // Start fresh.
     for f in [registry, envelope, &PathBuf::from("envelope_tampered.json"), &PathBuf::from("root.txt")] {
         let _ = std::fs::remove_file(f);
     }
     println!("=== ENROLL ===");
-    cmd_enroll(sgxs, registry);
+    cmd_enroll(target, registry);
     println!("\n=== PUBLISH ===");
     cmd_publish(registry);
     println!("\n=== RUN fib({}) ===", n);
-    cmd_run(sgxs, envelope, &[n.to_string()]);
+    cmd_run(target, envelope, &[n.to_string()]);
     println!("\n=== VERIFY ===");
     cmd_verify(registry, envelope);
 }
