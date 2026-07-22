@@ -23,6 +23,11 @@ fn main() {
         ("lib/librustc_driver-50415e81ad01135f.so", 0o755),
         ("lib/rustlib/riscv64gc-unknown-linux-gnu/lib/libcore-262ac8c5c52b8640.rlib", 0o644),
         ("lib/rustlib/riscv64gc-unknown-linux-gnu/lib/libcore-262ac8c5c52b8640.rmeta", 0o644),
+        // liballoc: closes the no_std heap gap (Vec/Box/String/...). It's a
+        // sysroot crate like libcore — rustc finds it via --sysroot inference
+        // from its own path, so `extern crate alloc;` needs no --extern flag.
+        ("lib/rustlib/riscv64gc-unknown-linux-gnu/lib/liballoc-4eb3b6afe27cee19.rlib", 0o644),
+        ("lib/rustlib/riscv64gc-unknown-linux-gnu/lib/liballoc-4eb3b6afe27cee19.rmeta", 0o644),
         ("lib/rustlib/riscv64gc-unknown-linux-gnu/lib/libcompiler_builtins-9efbfd211f15917a.rlib", 0o644),
         ("lib/rustlib/riscv64gc-unknown-linux-gnu/lib/libcompiler_builtins-9efbfd211f15917a.rmeta", 0o644),
         ("lib/rustlib/riscv64gc-unknown-linux-gnu/lib/librustc_std_workspace_core-0118aca45f05f0b9.rlib", 0o644),

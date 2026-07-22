@@ -16,7 +16,12 @@ BUNDLE      := fixtures/rootfs.zkfs
 RS          ?= fixtures/hello.rs
 N           ?= 20
 
-.PHONY: build demo demo-dry demo-fib bundle tamper-test clean
+# $(CLI)/$(REPLAY_SGXS)/$(FIB_SGXS) are marked .PHONY so they always re-run
+# cargo (which is incremental, so this is cheap). Without this, make treats
+# the existing binary as up-to-date even when its sources changed, and later
+# targets (demo, demo-dry, ...) silently run a stale CLI/enclave.
+.PHONY: build demo demo-dry demo-fib bundle tamper-test clean \
+        $(CLI) $(REPLAY_SGXS) $(FIB_SGXS)
 .DEFAULT_GOAL := build
 
 # ---- build everything needed for `make demo` --------------------------------
@@ -51,6 +56,15 @@ demo-dry: $(CLI) $(BUNDLE)
 	$(CLI) publish
 	$(CLI) compile-attest --native target/release/replay-rustc --bundle $(BUNDLE) --source $(RS)
 	$(CLI) verify-compile
+
+# Same, but for a multi-crate no_std workspace (Cargo.toml path deps, no SGX).
+WS ?= fixtures/workspace-demo
+demo-workspace-dry: $(CLI) $(BUNDLE)
+	cargo build --release -p replay-rustc
+	$(CLI) enroll  --native target/release/replay-rustc
+	$(CLI) publish
+	$(CLI) compile-workspace-attest --native target/release/replay-rustc --bundle $(BUNDLE) --workspace $(WS)
+	$(CLI) verify-compile-workspace
 
 # ---- extras -----------------------------------------------------------------
 # The original fibonacci attestation demo.

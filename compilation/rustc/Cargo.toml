@@ -1,0 +1,24 @@
+[package]
+name = "compilation-rustc"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+rvlinux = { path = "../../crates/rvlinux" }
+serde   = { workspace = true, features = ["alloc"] }
+
+# Host-only: Cargo.toml discovery / workspace scanning (`workspace` module)
+# and the `mkbundle` binary. Never compiled into the enclave (replay-rustc
+# depends on this crate with default features, i.e. without "host").
+toml = { version = "0.8", optional = true }
+sha2 = { workspace = true, optional = true, features = ["std"] }
+hex  = { workspace = true, optional = true, features = ["std"] }
+
+[features]
+host = ["dep:toml", "dep:sha2", "dep:hex"]
+
+[[bin]]
+name = "mkbundle"
+path = "src/bin/mkbundle.rs"
+required-features = ["host"]

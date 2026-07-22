@@ -3,7 +3,7 @@ resolver = "2"
 members = [
     "crates/attestations",
     "crates/rvlinux",
-    "crates/wrapped-rustc-lib",
+    "compilation/rustc",
     "programs/fibonacci",
     "programs/hello-rustc",
     "programs/replay-rustc",

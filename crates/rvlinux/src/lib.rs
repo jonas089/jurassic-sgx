@@ -13,7 +13,6 @@ extern crate std;
 pub mod bundle;
 pub mod cpu;
 pub mod fs;
-pub mod pipeline;
 pub mod loader;
 pub mod mem;
 pub mod sys;

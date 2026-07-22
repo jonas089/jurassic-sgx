@@ -35,5 +35,5 @@ cp -a "$WORK/x/rustc-$VER-$TGT/rustc/."          "$WORK/merged/"
 cp -a "$WORK/x/rust-std-$VER-$TGT/rust-std-$TGT/." "$WORK/merged/"
 
 echo "== 3/3 pack bundle (toolchain + committed glibc) =="
-cargo run --release --quiet --bin mkbundle -- "$WORK/merged" "$GLIBC" "$OUT"
+cargo run --release --quiet -p compilation-rustc --bin mkbundle --features host -- "$WORK/merged" "$GLIBC" "$OUT"
 echo "done -> $OUT"

@@ -13,7 +13,9 @@ attestations = { workspace = true, features = ["replay"] }
 serde_json   = { workspace = true }
 hex          = { workspace = true, features = ["std"] }
 # The rvlinux RV64 usermode-Linux emulator (no_std+alloc, builds for
-# x86_64-fortanix-unknown-sgx). The enclave re-executes the real rustc+lld
-# compile inside it and attests the source→binary binding.
+# x86_64-fortanix-unknown-sgx), and the verifiable-compilation pipeline built
+# on top of it (default features only — no "host", that half never runs in
+# the enclave). The enclave re-executes the real rustc+lld compile and
+# attests the source→binary binding.
 rvlinux           = { path = "../../crates/rvlinux" }
-wrapped-rustc-lib = { path = "../../crates/wrapped-rustc-lib" }
+compilation-rustc = { path = "../../compilation/rustc" }

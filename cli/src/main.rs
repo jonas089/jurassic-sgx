@@ -17,7 +17,9 @@ use attestations::replay::canonical_ast_hash;
 use attestations::transcript::{PublicInput, Replay, ReplayReport, Step, Transcript};
 use attestations::verify::verify_envelope;
 use clap::{Parser, Subcommand};
-use wrapped_rustc_lib::CompilationPublicValues;
+use compilation_rustc::public_values::{
+    BuildPlanDto, CompilationPublicValues, PlanCrateType, WorkspacePublicValues,
+};
 
 #[derive(Parser, Debug)]
 #[command(name = "sgx-attest", about = "SGX attestation pipeline (Merkle-rooted)")]
@@ -154,6 +156,43 @@ enum Cmd {
         #[arg(long)]
         expect_bin: Option<String>,
     },
+    /// DEBUG: host-side, no attestation — discover a workspace, run the
+    /// emulator pipeline in-process, and dump the linked binary to disk.
+    DebugEmuWorkspace {
+        #[arg(long)]
+        bundle: PathBuf,
+        #[arg(long)]
+        workspace: PathBuf,
+        #[arg(long, default_value = "workspace_bin.elf")]
+        out: PathBuf,
+    },
+    /// Run the replay enclave in `compile-workspace` mode: discover a local
+    /// multi-crate workspace (Cargo.toml `[package]` + path dependencies
+    /// only, no crates.io), build the compile plan, and produce a signed
+    /// source-tree→binary Envelope.
+    CompileWorkspaceAttest {
+        #[arg(long, conflicts_with = "native")]
+        sgxs: Option<PathBuf>,
+        #[arg(long)]
+        native: Option<PathBuf>,
+        #[arg(long)]
+        bundle: PathBuf,
+        /// Root directory of the workspace (one or more crates, each with
+        /// its own Cargo.toml; local path dependencies only).
+        #[arg(long)]
+        workspace: PathBuf,
+        #[arg(long, default_value = "envelope.json")]
+        out: PathBuf,
+    },
+    /// Verify a compile-workspace Envelope: signature + Merkle, then print
+    /// the build plan that was actually executed inside the enclave
+    /// (crates, `--extern` wiring, per-unit hashes) alongside the binary.
+    VerifyCompileWorkspace {
+        #[arg(long, default_value = "registry.json")]
+        registry: PathBuf,
+        #[arg(long, default_value = "envelope.json")]
+        envelope: PathBuf,
+    },
     /// Verify a replay envelope and print what was replayed vs. trusted.
     VerifyTranscript {
         #[arg(long, default_value = "registry.json")]
@@ -212,6 +251,13 @@ fn main() {
         }
         Cmd::VerifyCompile { registry, envelope, expect_bin } => {
             cmd_verify_compile(&registry, &envelope, expect_bin.as_deref())
+        }
+        Cmd::DebugEmuWorkspace { bundle, workspace, out } => cmd_debug_emu_workspace(&bundle, &workspace, &out),
+        Cmd::CompileWorkspaceAttest { sgxs, native, bundle, workspace, out } => {
+            cmd_compile_workspace_attest(&resolve_target(sgxs, native), &bundle, &workspace, &out)
+        }
+        Cmd::VerifyCompileWorkspace { registry, envelope } => {
+            cmd_verify_compile_workspace(&registry, &envelope)
         }
     }
 }
@@ -298,6 +344,159 @@ fn cmd_verify_compile(registry_path: &PathBuf, envelope_path: &PathBuf, expect_b
     }
 }
 
+/// DEBUG: run the workspace compile pipeline in-process (no enclave, no
+/// attestation) and write the linked binary to disk for inspection.
+fn cmd_debug_emu_workspace(bundle: &PathBuf, workspace_root: &PathBuf, out: &PathBuf) {
+    let bundle_bytes = std::fs::read(bundle).expect("read bundle");
+    let (plan, tree_bytes) = compilation_rustc::workspace::discover(workspace_root);
+    eprintln!("discovered {} crate(s)", plan.units.len());
+
+    let mut fs = rvlinux::fs::Fs::new();
+    rvlinux::bundle::parse_into(&mut fs, &bundle_bytes).expect("parse toolchain bundle");
+    rvlinux::bundle::parse_into(&mut fs, &tree_bytes).expect("parse source tree bundle");
+
+    let units: Vec<compilation_rustc::pipeline::CrateUnit> = plan
+        .units
+        .iter()
+        .map(|u| compilation_rustc::pipeline::CrateUnit {
+            name: u.name.clone(),
+            entry: format!("{}/{}", compilation_rustc::WORKSPACE_SRC_ROOT, u.entry.trim_start_matches('/')),
+            crate_type: match u.crate_type {
+                PlanCrateType::Lib => compilation_rustc::pipeline::CrateType::Lib,
+                PlanCrateType::Bin => compilation_rustc::pipeline::CrateType::Bin,
+            },
+            externs: u.externs.clone(),
+        })
+        .collect();
+    let rv_plan = compilation_rustc::pipeline::BuildPlan { units };
+
+    let envp = compilation_rustc::pipeline::default_envp();
+    match compilation_rustc::pipeline::compile_workspace_run(fs, &rv_plan, &envp, 0) {
+        Ok(res) => {
+            std::fs::write(out, &res.bin).unwrap();
+            println!("wrote {} ({} bytes)", out.display(), res.bin.len());
+            println!("run: exit={} instret={}", res.run.exit_code, res.run.instret);
+            println!("stdout: {}", String::from_utf8_lossy(&res.run.stdout));
+        }
+        Err(e) => {
+            eprintln!("FAILED: {e:?}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Discover a local multi-crate workspace (`cli::workspace::discover`), serve
+/// the toolchain bundle + packed source tree over one TCP socket (two
+/// length-prefixed blobs), run the replay program in `compile-workspace`
+/// mode, and capture the Envelope. Mirrors `cmd_compile_attest`.
+fn cmd_compile_workspace_attest(target: &Target, bundle: &PathBuf, workspace_root: &PathBuf, out: &PathBuf) {
+    use std::io::Write as _;
+    use std::net::TcpListener;
+
+    let bundle_bytes = std::fs::read(bundle).expect("read bundle");
+    let (plan, tree_bytes) = compilation_rustc::workspace::discover(workspace_root);
+    let plan_json = serde_json::to_vec(&plan).expect("serialize build plan");
+    let plan_hex = hex::encode(&plan_json);
+
+    eprintln!(
+        "discovered {} crate(s): {}",
+        plan.units.len(),
+        plan.units.iter().map(|u| u.name.as_str()).collect::<Vec<_>>().join(", "),
+    );
+
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind bundle server");
+    let port = listener.local_addr().unwrap().port();
+    eprintln!(
+        "serving {} MiB toolchain + {} KiB source tree on 127.0.0.1:{}",
+        bundle_bytes.len() / 1024 / 1024,
+        (tree_bytes.len() + 1023) / 1024,
+        port
+    );
+    let server = std::thread::spawn(move || {
+        fn send_blob(sock: &mut std::net::TcpStream, blob: &[u8]) -> std::io::Result<()> {
+            sock.write_all(&(blob.len() as u64).to_le_bytes())?;
+            sock.write_all(blob)
+        }
+        match listener.accept() {
+            Ok((mut sock, _)) => {
+                if let Err(e) = send_blob(&mut sock, &bundle_bytes).and_then(|_| send_blob(&mut sock, &tree_bytes)) {
+                    eprintln!("bundle server: send failed: {e}");
+                }
+            }
+            Err(e) => eprintln!("bundle server: accept failed: {e}"),
+        }
+    });
+
+    let args = ["compile-workspace".to_string(), plan_hex, port.to_string()];
+    let raw = run_program_capturing(target, &args);
+    server.join().ok();
+
+    std::fs::write(out, &raw).unwrap();
+    println!("wrote {} ({} bytes)", out.display(), raw.len());
+}
+
+/// Verify a compile-workspace Envelope and print the build plan + hashes
+/// the enclave actually committed to.
+fn cmd_verify_compile_workspace(registry_path: &PathBuf, envelope_path: &PathBuf) {
+    let registry: Registry =
+        serde_json::from_str(&std::fs::read_to_string(registry_path).unwrap()).unwrap();
+    let envelope: Envelope =
+        serde_json::from_str(&std::fs::read_to_string(envelope_path).unwrap()).unwrap();
+
+    let root = registry.root();
+    let mr = envelope.signed.att.mrenclave.0;
+    let leaf = registry.leaves.iter().find(|l| l.mrenclave.0 == mr)
+        .unwrap_or_else(|| panic!("MRENCLAVE {} not in registry", hex::encode(mr)))
+        .clone();
+    let proof = registry.prove(&mr).expect("merkle proof");
+
+    let verified = match verify_envelope(&root, &leaf, &proof, &envelope) {
+        Ok(v) => v,
+        Err(e) => { eprintln!("FAIL: envelope invalid: {:?}", e); std::process::exit(1); }
+    };
+
+    // The Envelope's signed `input` IS the build-plan JSON the enclave ran —
+    // verify_envelope already checked sha256(input) == att.input_hash, so
+    // decoding it here recovers exactly what was executed, not what the
+    // caller merely claims was requested.
+    let plan: BuildPlanDto = serde_json::from_slice(verified.input).expect("input is not a BuildPlanDto");
+    let pv: WorkspacePublicValues =
+        serde_json::from_slice(verified.output).expect("output is not WorkspacePublicValues");
+
+    if sha256(verified.input) != pv.plan_sha256 {
+        eprintln!("FAIL: plan_sha256 in public values doesn't match the signed input");
+        std::process::exit(1);
+    }
+
+    println!("envelope signature + merkle : OK");
+    println!("  enclave (MRENCLAVE)  = {}", hex::encode(verified.mrenclave));
+    println!("  toolchain bundle sha = {}", hex::encode(pv.bundle_sha256));
+    println!("  source tree  sha256  = {}", hex::encode(pv.source_tree_sha256));
+    println!("  build plan   sha256  = {}", hex::encode(pv.plan_sha256));
+    println!("  binary       sha256  = {}", hex::encode(pv.bin_sha256));
+    println!("  stdout       sha256  = {}", hex::encode(pv.stdout_sha256));
+    println!("  build plan executed inside the enclave ({} crate(s)):", plan.units.len());
+    for u in &pv.units {
+        let kind = match u.crate_type {
+            PlanCrateType::Lib => "lib",
+            PlanCrateType::Bin => "bin",
+        };
+        let externs: Vec<String> = u.externs.iter().map(|(a, b)| format!("{a}={b}")).collect();
+        println!(
+            "    - {:<10} [{}] externs=[{}] exit={} instret={:>10} artifact={}",
+            u.name, kind, externs.join(", "), u.exit_code, u.instret, hex::encode(u.artifact_sha256)
+        );
+    }
+    println!("  link/run exit        = {}/{}", pv.link_exit, pv.run_exit);
+    println!("  link/run instret     = {}/{}", pv.link_instret, pv.run_instret);
+
+    if pv.units.iter().any(|u| u.exit_code != 0) || pv.link_exit != 0 {
+        eprintln!("FAIL: workspace compilation did not succeed inside the enclave");
+        std::process::exit(1);
+    }
+    println!("VERIFIED: signed workspace source-tree→binary binding (build plan matches what ran)");
+}
+
 /// Run the emulator pipeline over a bundle + source and report the hashes.
 fn cmd_emu_compile(bundle: &PathBuf, source: &PathBuf, expect_bin: Option<&str>) {
     let bundle_bytes = std::fs::read(bundle).expect("read bundle");
@@ -307,12 +506,12 @@ fn cmd_emu_compile(bundle: &PathBuf, source: &PathBuf, expect_bin: Option<&str>)
     let n = rvlinux::bundle::parse_into(&mut fs, &bundle_bytes).expect("parse bundle");
     eprintln!("loaded bundle: {} entries, {} MiB", n, bundle_bytes.len() / 1024 / 1024);
 
-    let rustc_argv = rvlinux::pipeline::default_rustc_argv();
-    let lld_argv = rvlinux::pipeline::default_lld_argv();
-    let envp = rvlinux::pipeline::default_envp();
+    let rustc_argv = compilation_rustc::pipeline::default_rustc_argv();
+    let lld_argv = compilation_rustc::pipeline::default_lld_argv();
+    let envp = compilation_rustc::pipeline::default_envp();
 
     let t0 = std::time::Instant::now();
-    let res = rvlinux::pipeline::compile_link_run(fs, &source_bytes, &rustc_argv, &lld_argv, &envp, 0)
+    let res = compilation_rustc::pipeline::compile_link_run(fs, &source_bytes, &rustc_argv, &lld_argv, &envp, 0)
         .unwrap_or_else(|e| { eprintln!("pipeline failed: {:?}", e); std::process::exit(1); });
     let dt = t0.elapsed();
 
