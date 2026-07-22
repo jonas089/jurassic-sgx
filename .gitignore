@@ -8,6 +8,9 @@ root.txt
 transcript*.json
 /build
 /build2
+# Built from source by `make bundle` (pinned rustc tarballs + committed glibc).
+/fixtures/rootfs.zkfs
+/fixtures/rootfs.zkfs.part-*
 *.swp
 *.bak
 .DS_Store

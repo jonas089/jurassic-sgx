@@ -216,129 +216,39 @@ fn main() {
     }
 }
 
-/// Feed the bundle (stdin) + source to the replay enclave's `compile` mode and
-/// capture the signed Envelope.
+/// Serve the bundle over a localhost TCP socket, run the replay program in
+/// `compile` mode (it connects back for the bundle), and capture the Envelope.
+/// TCP reliably streams the ~471 MB bundle into an SGX enclave — unlike a large
+/// stdin feed — and reuses the same stdout capture the other commands use.
 fn cmd_compile_attest(target: &Target, bundle: &PathBuf, source: &PathBuf, out: &PathBuf) {
-    let bundle_bytes = std::fs::read(bundle).expect("read bundle");
-    let source_bytes = std::fs::read(source).expect("read source");
-    let source_hex = hex::encode(&source_bytes);
+    use std::io::Write as _;
+    use std::net::TcpListener;
 
-    let raw = match target {
-        Target::Native(bin) => run_compile_native(bin, &source_hex, bundle_bytes),
-        Target::Sgxs(sgxs) => run_compile_enclave(sgxs, &source_hex, bundle_bytes),
-    };
+    let bundle_bytes = std::fs::read(bundle).expect("read bundle");
+    let source_hex = hex::encode(std::fs::read(source).expect("read source"));
+
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind bundle server");
+    let port = listener.local_addr().unwrap().port();
+    eprintln!("serving {} MiB bundle on 127.0.0.1:{}", bundle_bytes.len() / 1024 / 1024, port);
+    let server = std::thread::spawn(move || {
+        // One shot: the enclave connects once, we send [u64 len][bundle].
+        match listener.accept() {
+            Ok((mut sock, _)) => {
+                let hdr = (bundle_bytes.len() as u64).to_le_bytes();
+                if let Err(e) = sock.write_all(&hdr).and_then(|_| sock.write_all(&bundle_bytes)) {
+                    eprintln!("bundle server: send failed: {e}");
+                }
+            }
+            Err(e) => eprintln!("bundle server: accept failed: {e}"),
+        }
+    });
+
+    let args = ["compile".to_string(), source_hex, port.to_string()];
+    let raw = run_program_capturing(target, &args);
+    server.join().ok();
+
     std::fs::write(out, &raw).unwrap();
     println!("wrote {} ({} bytes)", out.display(), raw.len());
-}
-
-/// Native dry-run: spawn the program in `compile` mode, stream the bundle to
-/// its stdin on a writer thread, and read the Envelope off its stdout.
-fn run_compile_native(bin: &PathBuf, source_hex: &str, bundle: Vec<u8>) -> Vec<u8> {
-    use std::io::{Read, Write};
-    use std::process::{Command, Stdio};
-
-    eprintln!("[dry-run] compiling in {} natively — stub identity, no hardware root of trust", bin.display());
-    let mut child = Command::new(bin)
-        .args(["compile", source_hex])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .unwrap_or_else(|e| { eprintln!("spawn {}: {}", bin.display(), e); std::process::exit(1); });
-
-    let mut stdin = child.stdin.take().unwrap();
-    let writer = std::thread::spawn(move || { let _ = stdin.write_all(&bundle); });
-    let mut out = Vec::new();
-    child.stdout.take().unwrap().read_to_end(&mut out).expect("read enclave stdout");
-    writer.join().ok();
-
-    let status = child.wait().expect("wait enclave");
-    if !status.success() {
-        eprintln!("enclave `compile` exited with {}", status);
-        std::process::exit(1);
-    }
-    out
-}
-
-#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
-fn run_compile_enclave(_sgxs: &PathBuf, _source_hex: &str, _bundle: Vec<u8>) -> Vec<u8> {
-    eprintln!("--sgxs requires x86_64 Linux with an SGX driver; on this platform use --native");
-    std::process::exit(2);
-}
-
-/// SGX: run the replay enclave in `compile` mode, streaming the bundle to its
-/// stdin (fd 0) and capturing the Envelope off its stdout (fd 1). Mirrors the
-/// stdout-capture fd juggling used elsewhere, plus a stdin feeder thread.
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-fn run_compile_enclave(sgxs: &PathBuf, source_hex: &str, bundle: Vec<u8>) -> Vec<u8> {
-    use std::io::{Read, Write as _};
-    use std::os::unix::io::FromRawFd;
-    use std::sync::{Arc, Mutex};
-    use std::thread;
-
-    use aesm_client::AesmClient;
-    use enclave_runner::EnclaveBuilder;
-    use enclave_runner_sgx::EnclaveBuilder as EnclaveBuilderSgx;
-    use sgxs_loaders::isgx::Device as IsgxDevice;
-
-    let aesm = AesmClient::new();
-    let mut device = IsgxDevice::new()
-        .expect("open /dev/isgx (legacy SGX driver)")
-        .einittoken_provider(aesm)
-        .build();
-
-    let mut sgx_builder = EnclaveBuilderSgx::new(sgxs.as_path());
-    if sgx_builder.coresident_signature().is_err() {
-        sgx_builder.dummy_signature();
-    }
-    let mut builder = EnclaveBuilder::new(sgx_builder);
-    builder.args(&["compile".to_string(), source_hex.to_string()]);
-    let enclave = builder.build(&mut device).expect("build enclave");
-
-    // Feed the bundle on fd 0.
-    let saved_stdin = unsafe { libc::dup(libc::STDIN_FILENO) };
-    let mut in_fds = [0i32; 2];
-    if unsafe { libc::pipe(in_fds.as_mut_ptr()) } < 0 { panic!("pipe stdin"); }
-    let (in_rd, in_wr) = (in_fds[0], in_fds[1]);
-    if unsafe { libc::dup2(in_rd, libc::STDIN_FILENO) } < 0 { panic!("dup2 stdin"); }
-    unsafe { libc::close(in_rd) };
-    let writer = thread::spawn(move || {
-        let mut f = unsafe { std::fs::File::from_raw_fd(in_wr) };
-        let _ = f.write_all(&bundle); // dropping f closes in_wr → EOF for the enclave
-    });
-
-    // Capture fd 1.
-    std::io::stdout().flush().ok();
-    let saved_stdout = unsafe { libc::dup(libc::STDOUT_FILENO) };
-    let mut out_fds = [0i32; 2];
-    if unsafe { libc::pipe(out_fds.as_mut_ptr()) } < 0 { panic!("pipe stdout"); }
-    let (out_rd, out_wr) = (out_fds[0], out_fds[1]);
-    if unsafe { libc::dup2(out_wr, libc::STDOUT_FILENO) } < 0 { panic!("dup2 stdout"); }
-    unsafe { libc::close(out_wr) };
-    let captured = Arc::new(Mutex::new(Vec::<u8>::new()));
-    let reader_buf = captured.clone();
-    let reader = thread::spawn(move || {
-        let mut f = unsafe { std::fs::File::from_raw_fd(out_rd) };
-        let mut buf = Vec::new();
-        f.read_to_end(&mut buf).ok();
-        *reader_buf.lock().unwrap() = buf;
-    });
-
-    let run_result = enclave.run();
-
-    std::io::stdout().flush().ok();
-    if unsafe { libc::dup2(saved_stdout, libc::STDOUT_FILENO) } < 0 { panic!("restore stdout"); }
-    unsafe { libc::close(saved_stdout) };
-    if unsafe { libc::dup2(saved_stdin, libc::STDIN_FILENO) } < 0 { panic!("restore stdin"); }
-    unsafe { libc::close(saved_stdin) };
-    writer.join().ok();
-    reader.join().expect("reader thread");
-
-    if let Err(e) = run_result {
-        eprintln!("enclave run error: {:?}", e);
-        std::process::exit(1);
-    }
-    Arc::try_unwrap(captured).unwrap().into_inner().unwrap()
 }
 
 /// Verify a compile Envelope and print the committed source→binary binding.
