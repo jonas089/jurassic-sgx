@@ -83,5 +83,5 @@ tamper-test: $(CLI)
 
 clean:
 	cargo clean
-	rm -f registry.json envelope.json envelope_tampered.json root.txt transcript.json
+	rm -f registry.json envelope.json envelope_tampered.json root.txt
 	rm -rf build build2

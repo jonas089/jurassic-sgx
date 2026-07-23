@@ -90,21 +90,21 @@ Reference specifications used throughout:
 ## Quickstart
 
 ```bash
-make demo                 # build, enroll, publish, run fib(20), verify
-make dry-run fibonacci    # same pipeline without SGX (works on macOS), stub identity
-make dry-run hello-rustc  # dry-run the verifiable-compilation example
+make demo                # attested compilation in SGX: real rustc + rust-lld
+                          # run in the rvlinux emulator, source -> binary
+make demo-dry             # same pipeline, no SGX (works on macOS/any host), stub identity
+make demo-workspace-dry   # multi-crate workspace compilation demo, no SGX
+make demo-fib             # the original fibonacci attestation demo (not compilation)
 make tamper-test          # mutate output, confirm verifier rejects
-make run N=42        # compute fib(42), write envelope.json
-make verify          # external verification of envelope.json
 ```
 
 Or directly:
 
 ```bash
-sgx-attest enroll  --sgxs path/to/fibonacci.sgxs
+sgx-attest enroll         --sgxs path/to/replay-rustc.sgxs
 sgx-attest publish
-sgx-attest run     --sgxs path/to/fibonacci.sgxs --out envelope.json -- 20
-sgx-attest verify  --registry registry.json --envelope envelope.json
+sgx-attest compile-attest --sgxs path/to/replay-rustc.sgxs --source fixtures/hello.rs
+sgx-attest verify-compile
 ```
 
 ## Dry run (no SGX, any platform)

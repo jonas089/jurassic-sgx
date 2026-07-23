@@ -5,7 +5,6 @@ members = [
     "crates/rvlinux",
     "compilation/rustc",
     "programs/fibonacci",
-    "programs/hello-rustc",
     "programs/replay-rustc",
     "cli",
 ]
