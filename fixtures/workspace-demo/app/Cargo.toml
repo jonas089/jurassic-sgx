@@ -6,3 +6,8 @@ edition = "2024"
 [dependencies]
 greet = { path = "../libs/greet" }
 collect = { path = "../libs/collect" }
+loud = { path = "../libs/loud", optional = true }
+
+[features]
+default = []
+loud = ["dep:loud"]

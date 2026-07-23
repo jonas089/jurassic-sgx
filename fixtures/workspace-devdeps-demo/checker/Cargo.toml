@@ -1,7 +1,4 @@
 [package]
-name = "collect"
+name = "checker"
 version = "0.1.0"
 edition = "2024"
-
-[dependencies]
-itoa = "1"

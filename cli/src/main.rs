@@ -122,8 +122,12 @@ enum Cmd {
     /// This is the exact computation the enclave will re-execute and attest.
     EmuCompile {
         /// ZKFS1 rootfs bundle containing the riscv64 rustc toolchain.
-        #[arg(long)]
+        /// Built automatically from source (cached) if it doesn't exist yet.
+        #[arg(long, default_value = "fixtures/rootfs.zkfs")]
         bundle: PathBuf,
+        /// Committed glibc runtime dir, used only if `--bundle` needs building.
+        #[arg(long, default_value = "fixtures/glibc")]
+        glibc: PathBuf,
         /// Rust source file to compile.
         #[arg(long)]
         source: PathBuf,
@@ -138,8 +142,12 @@ enum Cmd {
         sgxs: Option<PathBuf>,
         #[arg(long)]
         native: Option<PathBuf>,
-        #[arg(long)]
+        /// Built automatically from source (cached) if it doesn't exist yet.
+        #[arg(long, default_value = "fixtures/rootfs.zkfs")]
         bundle: PathBuf,
+        /// Committed glibc runtime dir, used only if `--bundle` needs building.
+        #[arg(long, default_value = "fixtures/glibc")]
+        glibc: PathBuf,
         #[arg(long)]
         source: PathBuf,
         #[arg(long, default_value = "envelope.json")]
@@ -159,28 +167,44 @@ enum Cmd {
     /// DEBUG: host-side, no attestation — discover a workspace, run the
     /// emulator pipeline in-process, and dump the linked binary to disk.
     DebugEmuWorkspace {
-        #[arg(long)]
+        /// Built automatically from source (cached) if it doesn't exist yet.
+        #[arg(long, default_value = "fixtures/rootfs.zkfs")]
         bundle: PathBuf,
+        /// Committed glibc runtime dir, used only if `--bundle` needs building.
+        #[arg(long, default_value = "fixtures/glibc")]
+        glibc: PathBuf,
         #[arg(long)]
         workspace: PathBuf,
+        /// Make the root bin crate's [dev-dependencies] available too (as
+        /// ordinary --externs; there's no separate test-harness mode).
+        #[arg(long)]
+        dev: bool,
         #[arg(long, default_value = "workspace_bin.elf")]
         out: PathBuf,
     },
     /// Run the replay enclave in `compile-workspace` mode: discover a local
-    /// multi-crate workspace (Cargo.toml `[package]` + path dependencies
-    /// only, no crates.io), build the compile plan, and produce a signed
-    /// source-tree→binary Envelope.
+    /// multi-crate workspace (Cargo.toml `[package]`, path *and* crates.io
+    /// dependencies, `[features]`), build the compile plan, and produce a
+    /// signed source-tree→binary Envelope.
     CompileWorkspaceAttest {
         #[arg(long, conflicts_with = "native")]
         sgxs: Option<PathBuf>,
         #[arg(long)]
         native: Option<PathBuf>,
-        #[arg(long)]
+        /// Built automatically from source (cached) if it doesn't exist yet.
+        #[arg(long, default_value = "fixtures/rootfs.zkfs")]
         bundle: PathBuf,
+        /// Committed glibc runtime dir, used only if `--bundle` needs building.
+        #[arg(long, default_value = "fixtures/glibc")]
+        glibc: PathBuf,
         /// Root directory of the workspace (one or more crates, each with
-        /// its own Cargo.toml; local path dependencies only).
+        /// its own Cargo.toml; local path or crates.io dependencies).
         #[arg(long)]
         workspace: PathBuf,
+        /// Make the root bin crate's [dev-dependencies] available too (as
+        /// ordinary --externs; there's no separate test-harness mode).
+        #[arg(long)]
+        dev: bool,
         #[arg(long, default_value = "envelope.json")]
         out: PathBuf,
     },
@@ -243,18 +267,20 @@ fn main() {
         Cmd::VerifyTranscript { registry, envelope, binary } => {
             cmd_verify_transcript(&registry, &envelope, binary.as_deref())
         }
-        Cmd::EmuCompile { bundle, source, expect_bin } => {
-            cmd_emu_compile(&bundle, &source, expect_bin.as_deref())
+        Cmd::EmuCompile { bundle, glibc, source, expect_bin } => {
+            cmd_emu_compile(&bundle, &glibc, &source, expect_bin.as_deref())
         }
-        Cmd::CompileAttest { sgxs, native, bundle, source, out } => {
-            cmd_compile_attest(&resolve_target(sgxs, native), &bundle, &source, &out)
+        Cmd::CompileAttest { sgxs, native, bundle, glibc, source, out } => {
+            cmd_compile_attest(&resolve_target(sgxs, native), &bundle, &glibc, &source, &out)
         }
         Cmd::VerifyCompile { registry, envelope, expect_bin } => {
             cmd_verify_compile(&registry, &envelope, expect_bin.as_deref())
         }
-        Cmd::DebugEmuWorkspace { bundle, workspace, out } => cmd_debug_emu_workspace(&bundle, &workspace, &out),
-        Cmd::CompileWorkspaceAttest { sgxs, native, bundle, workspace, out } => {
-            cmd_compile_workspace_attest(&resolve_target(sgxs, native), &bundle, &workspace, &out)
+        Cmd::DebugEmuWorkspace { bundle, glibc, workspace, dev, out } => {
+            cmd_debug_emu_workspace(&bundle, &glibc, &workspace, dev, &out)
+        }
+        Cmd::CompileWorkspaceAttest { sgxs, native, bundle, glibc, workspace, dev, out } => {
+            cmd_compile_workspace_attest(&resolve_target(sgxs, native), &bundle, &glibc, &workspace, dev, &out)
         }
         Cmd::VerifyCompileWorkspace { registry, envelope } => {
             cmd_verify_compile_workspace(&registry, &envelope)
@@ -266,11 +292,11 @@ fn main() {
 /// `compile` mode (it connects back for the bundle), and capture the Envelope.
 /// TCP reliably streams the ~471 MB bundle into an SGX enclave — unlike a large
 /// stdin feed — and reuses the same stdout capture the other commands use.
-fn cmd_compile_attest(target: &Target, bundle: &PathBuf, source: &PathBuf, out: &PathBuf) {
+fn cmd_compile_attest(target: &Target, bundle: &PathBuf, glibc: &PathBuf, source: &PathBuf, out: &PathBuf) {
     use std::io::Write as _;
     use std::net::TcpListener;
 
-    let bundle_bytes = std::fs::read(bundle).expect("read bundle");
+    let bundle_bytes = compilation_rustc::toolchain::ensure_bundle(bundle, glibc);
     let source_hex = hex::encode(std::fs::read(source).expect("read source"));
 
     let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind bundle server");
@@ -346,29 +372,16 @@ fn cmd_verify_compile(registry_path: &PathBuf, envelope_path: &PathBuf, expect_b
 
 /// DEBUG: run the workspace compile pipeline in-process (no enclave, no
 /// attestation) and write the linked binary to disk for inspection.
-fn cmd_debug_emu_workspace(bundle: &PathBuf, workspace_root: &PathBuf, out: &PathBuf) {
-    let bundle_bytes = std::fs::read(bundle).expect("read bundle");
-    let (plan, tree_bytes) = compilation_rustc::workspace::discover(workspace_root);
+fn cmd_debug_emu_workspace(bundle: &PathBuf, glibc: &PathBuf, workspace_root: &PathBuf, dev: bool, out: &PathBuf) {
+    let bundle_bytes = compilation_rustc::toolchain::ensure_bundle(bundle, glibc);
+    let (plan, tree_bytes) = compilation_rustc::workspace::discover(workspace_root, dev);
     eprintln!("discovered {} crate(s)", plan.units.len());
 
     let mut fs = rvlinux::fs::Fs::new();
     rvlinux::bundle::parse_into(&mut fs, &bundle_bytes).expect("parse toolchain bundle");
     rvlinux::bundle::parse_into(&mut fs, &tree_bytes).expect("parse source tree bundle");
 
-    let units: Vec<compilation_rustc::pipeline::CrateUnit> = plan
-        .units
-        .iter()
-        .map(|u| compilation_rustc::pipeline::CrateUnit {
-            name: u.name.clone(),
-            entry: format!("{}/{}", compilation_rustc::WORKSPACE_SRC_ROOT, u.entry.trim_start_matches('/')),
-            crate_type: match u.crate_type {
-                PlanCrateType::Lib => compilation_rustc::pipeline::CrateType::Lib,
-                PlanCrateType::Bin => compilation_rustc::pipeline::CrateType::Bin,
-            },
-            externs: u.externs.clone(),
-        })
-        .collect();
-    let rv_plan = compilation_rustc::pipeline::BuildPlan { units };
+    let rv_plan = compilation_rustc::pipeline::BuildPlan::from(&plan);
 
     let envp = compilation_rustc::pipeline::default_envp();
     match compilation_rustc::pipeline::compile_workspace_run(fs, &rv_plan, &envp, 0) {
@@ -389,12 +402,12 @@ fn cmd_debug_emu_workspace(bundle: &PathBuf, workspace_root: &PathBuf, out: &Pat
 /// the toolchain bundle + packed source tree over one TCP socket (two
 /// length-prefixed blobs), run the replay program in `compile-workspace`
 /// mode, and capture the Envelope. Mirrors `cmd_compile_attest`.
-fn cmd_compile_workspace_attest(target: &Target, bundle: &PathBuf, workspace_root: &PathBuf, out: &PathBuf) {
+fn cmd_compile_workspace_attest(target: &Target, bundle: &PathBuf, glibc: &PathBuf, workspace_root: &PathBuf, dev: bool, out: &PathBuf) {
     use std::io::Write as _;
     use std::net::TcpListener;
 
-    let bundle_bytes = std::fs::read(bundle).expect("read bundle");
-    let (plan, tree_bytes) = compilation_rustc::workspace::discover(workspace_root);
+    let bundle_bytes = compilation_rustc::toolchain::ensure_bundle(bundle, glibc);
+    let (plan, tree_bytes) = compilation_rustc::workspace::discover(workspace_root, dev);
     let plan_json = serde_json::to_vec(&plan).expect("serialize build plan");
     let plan_hex = hex::encode(&plan_json);
 
@@ -498,8 +511,8 @@ fn cmd_verify_compile_workspace(registry_path: &PathBuf, envelope_path: &PathBuf
 }
 
 /// Run the emulator pipeline over a bundle + source and report the hashes.
-fn cmd_emu_compile(bundle: &PathBuf, source: &PathBuf, expect_bin: Option<&str>) {
-    let bundle_bytes = std::fs::read(bundle).expect("read bundle");
+fn cmd_emu_compile(bundle: &PathBuf, glibc: &PathBuf, source: &PathBuf, expect_bin: Option<&str>) {
+    let bundle_bytes = compilation_rustc::toolchain::ensure_bundle(bundle, glibc);
     let source_bytes = std::fs::read(source).expect("read source");
 
     let mut fs = rvlinux::fs::Fs::new();

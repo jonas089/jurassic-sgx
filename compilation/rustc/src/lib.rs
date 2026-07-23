@@ -9,8 +9,9 @@
 //!
 //! `no_std` + `alloc` by default so it builds for the enclave
 //! (`programs/replay-rustc`); the `host` feature adds `workspace`
-//! (Cargo.toml discovery) and the `mkbundle` binary, neither of which ever
-//! runs inside the enclave.
+//! (Cargo.toml discovery, feature resolution) and `registry` (crates.io
+//! fetching) plus the `mkbundle` binary — none of which ever run inside
+//! the enclave.
 
 #![cfg_attr(not(feature = "host"), no_std)]
 
@@ -20,6 +21,10 @@ extern crate std;
 
 pub mod pipeline;
 pub mod public_values;
+#[cfg(feature = "host")]
+pub mod registry;
+#[cfg(feature = "host")]
+pub mod toolchain;
 #[cfg(feature = "host")]
 pub mod workspace;
 

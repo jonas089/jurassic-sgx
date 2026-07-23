@@ -59,12 +59,18 @@ pub struct PlanCrateUnit {
     pub name: String,
     pub entry: String,
     pub crate_type: PlanCrateType,
+    /// This crate's own `Cargo.toml` `edition` (defaults to `"2015"` if
+    /// omitted, matching real Cargo).
+    pub edition: String,
+    /// Activated feature names, passed to rustc as `--cfg feature="name"`.
+    pub cfg_features: Vec<String>,
     /// `(extern_name, dependency unit name)` pairs.
     pub externs: Vec<(String, String)>,
 }
 
 /// The host-computed, already-topologically-sorted build plan for a
-/// multi-crate workspace. Local path dependencies only — no crates.io.
+/// multi-crate workspace: local path dependencies and (optionally)
+/// crates.io dependencies fetched and vendored in by `workspace::discover`.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct BuildPlanDto {
     pub units: Vec<PlanCrateUnit>,

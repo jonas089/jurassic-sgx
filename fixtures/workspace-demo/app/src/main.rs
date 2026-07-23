@@ -1,7 +1,11 @@
 //! Multi-crate no_std workspace demo: app -> greet -> leftpad (+ a `mod`
 //! split inside greet), and app -> collect (heap: Vec + alloc::format!),
 //! all compiled and linked inside the enclave from Cargo.toml-driven path
-//! dependencies, with app supplying its own global allocator.
+//! dependencies, with app supplying its own global allocator. `app`'s
+//! `loud` feature (off by default) additionally activates the optional
+//! `loud` crate — proves the workspace scanner's Cargo `[features]`
+//! resolution actually gates which crates get compiled/linked, not just
+//! which `#[cfg(feature = ...)]` branches run.
 #![no_std]
 #![no_main]
 
@@ -30,6 +34,14 @@ pub extern "C" fn _start() -> ! {
     let sum = collect::sum_doubled(&[1, 2, 3, 4, 5]);
     let msg = alloc::format!("heap sum = {}\n", sum);
     write(msg.as_bytes());
+    write(collect::format_sum(&[1, 2, 3, 4, 5]).as_bytes());
+
+    #[cfg(feature = "loud")]
+    {
+        let mut shout_buf = [0u8; 16];
+        let n = loud::shout(b"quiet\n", &mut shout_buf);
+        write(&shout_buf[..n]);
+    }
 
     unsafe {
         asm!(

@@ -1,13 +1,17 @@
 ## jurassic-sgx — verifiable compilation on SGX.
 ##
-##   make build      build the CLI, the SGX enclave, and the toolchain bundle
-##                   (bundle is built FROM SOURCE: pinned rustc tarballs +
-##                   committed glibc — no large blob in git)
+##   make build      build the CLI and the SGX enclave
 ##   make demo       attested compilation inside SGX: the enclave runs real
 ##                   rustc + rust-lld in the rvlinux emulator and signs
 ##                   source -> binary, with a live progress bar
 ##   make demo-dry   same, without SGX (any host; stub identity, no root of trust)
-##   make bundle     (re)build fixtures/rootfs.zkfs from source
+##   make bundle     (re)build fixtures/rootfs.zkfs from source explicitly
+##
+## The toolchain bundle (fixtures/rootfs.zkfs, pinned rustc tarballs merged
+## with the committed glibc) no longer needs a separate build step: any CLI
+## command that needs it builds + caches it automatically on first use, the
+## same way crates.io dependencies are now fetched lazily. `make bundle`
+## still exists for pre-warming the cache (e.g. in CI) or forcing a rebuild.
 
 CLI         := target/release/sgx-attest
 REPLAY_SGXS := target/x86_64-fortanix-unknown-sgx/release/replay-rustc.sgxs
@@ -25,7 +29,7 @@ N           ?= 20
 .DEFAULT_GOAL := build
 
 # ---- build everything needed for `make demo` --------------------------------
-build: $(CLI) $(REPLAY_SGXS) $(BUNDLE)
+build: $(CLI) $(REPLAY_SGXS)
 
 $(CLI):
 	cargo build --release -p sgx-attest-cli
@@ -35,11 +39,8 @@ $(REPLAY_SGXS):
 	ftxsgx-elf2sgxs target/x86_64-fortanix-unknown-sgx/release/replay-rustc \
 	    --heap-size 0x80000000 --stack-size 0x400000 --threads 2 --debug
 
-# ---- the toolchain bundle, built from source --------------------------------
-# Downloads the pinned rustc 1.96.1 riscv64 tarballs (sha256-verified) and packs
-# them with the committed glibc via mkbundle. ~105MB download, no blob in git.
-bundle: $(BUNDLE)
-$(BUNDLE): $(CLI) scripts/build-bundle.sh fixtures/glibc/libc.so.6
+# ---- explicit/manual toolchain bundle build (optional — see header) --------
+bundle: $(CLI)
 	bash scripts/build-bundle.sh
 
 # ---- the demo: attested compilation in SGX ----------------------------------
@@ -50,16 +51,17 @@ demo: build
 	$(CLI) verify-compile
 
 # Same pipeline without SGX (macOS / any host): stub identity, no root of trust.
-demo-dry: $(CLI) $(BUNDLE)
+demo-dry: $(CLI)
 	cargo build --release -p replay-rustc
 	$(CLI) enroll  --native target/release/replay-rustc
 	$(CLI) publish
 	$(CLI) compile-attest --native target/release/replay-rustc --bundle $(BUNDLE) --source $(RS)
 	$(CLI) verify-compile
 
-# Same, but for a multi-crate no_std workspace (Cargo.toml path deps, no SGX).
+# Same, but for a multi-crate no_std workspace (Cargo.toml path/crates.io
+# deps + features, no SGX).
 WS ?= fixtures/workspace-demo
-demo-workspace-dry: $(CLI) $(BUNDLE)
+demo-workspace-dry: $(CLI)
 	cargo build --release -p replay-rustc
 	$(CLI) enroll  --native target/release/replay-rustc
 	$(CLI) publish

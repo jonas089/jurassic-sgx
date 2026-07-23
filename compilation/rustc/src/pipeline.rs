@@ -8,6 +8,9 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 use rvlinux::fs::{Fs, Node};
+
+use crate::public_values::{BuildPlanDto, PlanCrateType};
+use crate::WORKSPACE_SRC_ROOT;
 use rvlinux::{Machine, RunError};
 
 pub const SOURCE_PATH: &str = "/work/hello.rs";
@@ -259,6 +262,15 @@ pub struct CrateUnit {
     /// Absolute path (inside the guest fs) to the crate root `.rs` file.
     pub entry: String,
     pub crate_type: CrateType,
+    /// Rust edition this crate was authored against (`"2015"`/`"2018"`/
+    /// `"2021"`/`"2024"`), from its own `Cargo.toml` — each crate compiles
+    /// under its own edition, exactly like a real cargo build (a workspace
+    /// routinely mixes editions across crates).
+    pub edition: String,
+    /// Feature names activated for this crate, passed as `--cfg
+    /// feature="name"` — what `#[cfg(feature = "name")]` in its source
+    /// tests against.
+    pub cfg_features: Vec<String>,
     /// `(extern_name, dependency unit name)` pairs; each dependency must
     /// appear earlier in [`BuildPlan::units`].
     pub externs: Vec<(String, String)>,
@@ -268,6 +280,33 @@ pub struct CrateUnit {
 /// Exactly one unit must be [`CrateType::Bin`] (the final linked program).
 pub struct BuildPlan {
     pub units: Vec<CrateUnit>,
+}
+
+impl From<&BuildPlanDto> for BuildPlan {
+    /// The one place `BuildPlanDto` (the wire format both the CLI and the
+    /// enclave send/receive) becomes the `pipeline`-native `BuildPlan` —
+    /// used by both `replay-rustc` (enclave side, executing a received
+    /// plan) and the CLI's `debug-emu-workspace` (host-side dry run), so
+    /// this conversion exists in exactly one place rather than being
+    /// reimplemented at each call site.
+    fn from(dto: &BuildPlanDto) -> Self {
+        let units = dto
+            .units
+            .iter()
+            .map(|u| CrateUnit {
+                name: u.name.clone(),
+                entry: alloc::format!("{}/{}", WORKSPACE_SRC_ROOT, u.entry.trim_start_matches('/')),
+                crate_type: match u.crate_type {
+                    PlanCrateType::Lib => CrateType::Lib,
+                    PlanCrateType::Bin => CrateType::Bin,
+                },
+                edition: u.edition.clone(),
+                cfg_features: u.cfg_features.clone(),
+                externs: u.externs.clone(),
+            })
+            .collect();
+        BuildPlan { units }
+    }
 }
 
 #[derive(Debug)]
@@ -346,7 +385,7 @@ fn unit_rustc_argv(
     let mut argv: Vec<String> = [
         "/opt/rust/bin/rustc",
         "--edition",
-        "2024",
+        unit.edition.as_str(),
         "-O",
         "-C",
         "panic=abort",
@@ -366,6 +405,10 @@ fn unit_rustc_argv(
             argv.push("--emit=link".to_string());
         }
         CrateType::Bin => argv.push("--emit=obj".to_string()),
+    }
+    for feature in &unit.cfg_features {
+        argv.push("--cfg".to_string());
+        argv.push(alloc::format!("feature=\"{}\"", feature));
     }
     // Every already-built rlib lives here. Direct dependencies still need an
     // explicit `--extern` (source resolves them by that name), but rustc also

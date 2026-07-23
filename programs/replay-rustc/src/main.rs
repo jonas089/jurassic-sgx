@@ -32,7 +32,7 @@ use attestations::transcript::Transcript;
 use compilation_rustc::public_values::{
     BuildPlanDto, CompilationPublicValues, PlanCrateType, UnitPublicValues, WorkspacePublicValues,
 };
-use compilation_rustc::{argv_bytes, WORKSPACE_SRC_ROOT};
+use compilation_rustc::argv_bytes;
 
 const PROGRAM_NAME: &str = "replay-rustc";
 
@@ -144,23 +144,6 @@ fn read_len_prefixed(stream: &mut TcpStream) -> Vec<u8> {
     buf
 }
 
-fn to_build_plan(dto: &BuildPlanDto) -> compilation_rustc::pipeline::BuildPlan {
-    let units = dto
-        .units
-        .iter()
-        .map(|u| compilation_rustc::pipeline::CrateUnit {
-            name: u.name.clone(),
-            entry: format!("{}/{}", WORKSPACE_SRC_ROOT, u.entry.trim_start_matches('/')),
-            crate_type: match u.crate_type {
-                PlanCrateType::Lib => compilation_rustc::pipeline::CrateType::Lib,
-                PlanCrateType::Bin => compilation_rustc::pipeline::CrateType::Bin,
-            },
-            externs: u.externs.clone(),
-        })
-        .collect();
-    compilation_rustc::pipeline::BuildPlan { units }
-}
-
 /// Same as [`compile_mode`], but for a multi-crate workspace: the CLI sends
 /// the toolchain bundle *and* the packed source tree over the same socket
 /// (two length-prefixed blobs), and the build plan (which local crates to
@@ -189,7 +172,7 @@ fn compile_workspace_mode(plan_hex: String, port_str: String) {
     drop(tree);
 
     let dto: BuildPlanDto = serde_json::from_slice(&plan_json).expect("parse build plan json");
-    let plan = to_build_plan(&dto);
+    let plan = compilation_rustc::pipeline::BuildPlan::from(&dto);
 
     attestations::enclave::commit_with_input(PROGRAM_NAME, plan_json, move |plan_json| {
         let plan_sha256 = sha256(plan_json);
