@@ -9,7 +9,7 @@ name = "replay-rustc"
 path = "src/main.rs"
 
 [dependencies]
-attestations = { workspace = true, features = ["replay"] }
+attestations = { workspace = true }
 serde_json   = { workspace = true }
 hex          = { workspace = true, features = ["std"] }
 # The rvlinux RV64 usermode-Linux emulator (no_std+alloc, builds for

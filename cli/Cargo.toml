@@ -9,7 +9,7 @@ name = "sgx-attest"
 path = "src/main.rs"
 
 [dependencies]
-attestations      = { workspace = true, features = ["replay"] }
+attestations      = { workspace = true }
 rvlinux           = { path = "../crates/rvlinux" }
 compilation-rustc = { path = "../compilation/rustc", features = ["host"] }
 ed25519-dalek = { workspace = true, features = ["std"] }

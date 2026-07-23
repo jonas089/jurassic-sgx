@@ -15,7 +15,6 @@
 //!                               on each other) as the hex argv. The enclave
 //!                               executes exactly that plan and signs a
 //!                               WorkspacePublicValues committing to it.
-//!   compute <hex-transcript>  → (legacy) selective transcript replay.
 //!
 //! `compile` is pure computation (the emulator is no_std+alloc), so it runs on
 //! `x86_64-fortanix-unknown-sgx`. The large toolchain bundle arrives on stdin;
@@ -27,8 +26,6 @@ use std::io::Read;
 use std::net::{SocketAddr, TcpStream};
 
 use attestations::core::sha256;
-use attestations::replay::replay;
-use attestations::transcript::Transcript;
 use compilation_rustc::public_values::{
     BuildPlanDto, CompilationPublicValues, PlanCrateType, UnitPublicValues, WorkspacePublicValues,
 };
@@ -50,21 +47,10 @@ fn main() {
             args.get(2).cloned().unwrap_or_default(),
             args.get(3).cloned().unwrap_or_default(),
         ),
-        "compute" => {
-            let hex_transcript = args.get(2).cloned().unwrap_or_default();
-            let transcript_bytes = hex::decode(hex_transcript.trim())
-                .expect("transcript arg must be hex-encoded JSON");
-            attestations::enclave::commit_with_input(PROGRAM_NAME, transcript_bytes, |input| {
-                let transcript: Transcript =
-                    serde_json::from_slice(input).expect("deserialize transcript");
-                let report = replay(&transcript);
-                serde_json::to_vec(&report).expect("serialize replay report")
-            });
-        }
         other => {
             eprintln!(
                 "unknown mode: {} (expected: enroll | compile <hex-source> | \
-                 compile-workspace <hex-plan> <port> | compute <hex-transcript>)",
+                 compile-workspace <hex-plan> <port>)",
                 other
             );
             std::process::exit(2);
