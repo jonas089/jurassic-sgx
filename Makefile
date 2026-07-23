@@ -4,20 +4,24 @@
 ##   make demo        attested compilation inside SGX: the enclave runs real
 ##                    rustc + rust-lld in the rvlinux emulator and signs
 ##                    source -> binary, with a live progress bar
-##   make demo-dry    same, without SGX (any host; stub identity, no root of trust)
+##   make demo DRY=1  same, without SGX (any host; stub identity, no root of trust)
 ##   make bundle      (re)build fixtures/rootfs.zkfs from source explicitly
 ##
-## PROGRAM selects *what* gets compiled, for both demo and demo-dry: a single
-## .rs source file, or a workspace directory (one or more crates, each with
-## its own Cargo.toml somewhere under it) — auto-detected from whether
-## PROGRAM is a file or a directory, so there's one variable to override
-## regardless of which kind of program it is. Defaults to fixtures/hello.rs.
+## (There's no `--dry-run` flag: that spelling is already GNU Make's own
+## "print commands, don't run them" flag, so DRY=1 is used instead to avoid
+## silently colliding with it.)
 ##
-##   make demo-dry PROGRAM=fixtures/hello.rs
-##   make demo-dry PROGRAM=fixtures/workspace-demo
-##   make demo-dry PROGRAM=fixtures/workspace-devdeps-demo DEV=1
-##   make demo     PROGRAM=path/to/your/single_file.rs
-##   make demo     PROGRAM=path/to/your/workspace
+## PROGRAM selects *what* gets compiled: a single .rs source file, or a
+## workspace directory (one or more crates, each with its own Cargo.toml
+## somewhere under it) — auto-detected from whether PROGRAM is a file or a
+## directory, so there's one variable to override regardless of which kind
+## of program it is. Defaults to fixtures/hello.rs.
+##
+##   make demo DRY=1 PROGRAM=fixtures/hello.rs
+##   make demo DRY=1 PROGRAM=fixtures/workspace-demo
+##   make demo DRY=1 PROGRAM=fixtures/workspace-devdeps-demo DEV=1
+##   make demo       PROGRAM=path/to/your/single_file.rs   # real SGX
+##   make demo       PROGRAM=path/to/your/workspace        # real SGX
 ##
 ## DEV=1 additionally links each workspace crate's [dev-dependencies] (only
 ## meaningful when PROGRAM is a workspace, e.g. workspace-devdeps-demo).
@@ -44,12 +48,24 @@ WORKSPACE := $(shell test -d "$(PROGRAM)" && echo 1)
 DEV       ?=
 DEV_FLAG  := $(if $(DEV),--dev,)
 
+# DRY=1 runs replay-rustc as an ordinary native process (stub identity, no
+# SGX hardware root of trust) instead of building/loading the real .sgxs
+# enclave. Picked once, at parse time, so it can gate both the prerequisite
+# list and the --sgxs/--native flag passed to the CLI below.
+DRY ?=
+ifeq ($(DRY),1)
+DEMO_DEPS   := $(CLI) $(REPLAY_NATIVE)
+TARGET_FLAG := --native $(REPLAY_NATIVE)
+else
+DEMO_DEPS   := build
+TARGET_FLAG := --sgxs $(REPLAY_SGXS)
+endif
+
 # $(CLI)/$(REPLAY_SGXS)/$(REPLAY_NATIVE)/$(FIB_SGXS) are marked .PHONY so
 # they always re-run cargo (which is incremental, so this is cheap). Without
 # this, make treats the existing binary as up-to-date even when its sources
-# changed, and later targets (demo, demo-dry, ...) silently run a stale
-# CLI/enclave.
-.PHONY: build demo demo-dry demo-fib bundle tamper-test clean \
+# changed, and later targets (demo, ...) silently run a stale CLI/enclave.
+.PHONY: build demo demo-fib bundle tamper-test clean \
         $(CLI) $(REPLAY_SGXS) $(REPLAY_NATIVE) $(FIB_SGXS)
 .DEFAULT_GOAL := build
 
@@ -71,27 +87,17 @@ $(REPLAY_NATIVE):
 bundle: $(CLI)
 	bash scripts/build-bundle.sh
 
-# ---- the demo: attested compilation in SGX, for whatever PROGRAM points at --
-demo: build
-	$(CLI) enroll  --sgxs $(REPLAY_SGXS)
+# ---- the demo: attested compilation, for whatever PROGRAM points at --------
+# Real SGX by default; DRY=1 switches to a native stub-identity run (see
+# TARGET_FLAG/DEMO_DEPS above).
+demo: $(DEMO_DEPS)
+	$(CLI) enroll  $(TARGET_FLAG)
 	$(CLI) publish
 ifeq ($(WORKSPACE),1)
-	$(CLI) compile-workspace-attest --sgxs $(REPLAY_SGXS) --bundle $(BUNDLE) --workspace $(PROGRAM) $(DEV_FLAG)
+	$(CLI) compile-workspace-attest $(TARGET_FLAG) --bundle $(BUNDLE) --workspace $(PROGRAM) $(DEV_FLAG)
 	$(CLI) verify-compile-workspace
 else
-	$(CLI) compile-attest --sgxs $(REPLAY_SGXS) --bundle $(BUNDLE) --source $(PROGRAM)
-	$(CLI) verify-compile
-endif
-
-# Same pipeline without SGX (macOS / any host): stub identity, no root of trust.
-demo-dry: $(CLI) $(REPLAY_NATIVE)
-	$(CLI) enroll  --native $(REPLAY_NATIVE)
-	$(CLI) publish
-ifeq ($(WORKSPACE),1)
-	$(CLI) compile-workspace-attest --native $(REPLAY_NATIVE) --bundle $(BUNDLE) --workspace $(PROGRAM) $(DEV_FLAG)
-	$(CLI) verify-compile-workspace
-else
-	$(CLI) compile-attest --native $(REPLAY_NATIVE) --bundle $(BUNDLE) --source $(PROGRAM)
+	$(CLI) compile-attest $(TARGET_FLAG) --bundle $(BUNDLE) --source $(PROGRAM)
 	$(CLI) verify-compile
 endif
 

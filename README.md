@@ -90,27 +90,30 @@ Reference specifications used throughout:
 ## Quickstart
 
 ```bash
-make demo        # attested compilation in SGX: real rustc + rust-lld
-                  # run in the rvlinux emulator, source -> binary
-make demo-dry     # same pipeline, no SGX (works on macOS/any host), stub identity
-make demo-fib     # the original fibonacci attestation demo (not compilation)
-make tamper-test  # mutate output, confirm verifier rejects
+make demo            # attested compilation in SGX: real rustc + rust-lld
+                      # run in the rvlinux emulator, source -> binary
+make demo DRY=1       # same pipeline, no SGX (works on macOS/any host), stub identity
+make demo-fib         # the original fibonacci attestation demo (not compilation)
+make tamper-test      # mutate output, confirm verifier rejects
 ```
 
-Both `demo` and `demo-dry` compile whatever `PROGRAM` points at: a single
-`.rs` file, or a directory (a workspace — one or more crates, each with its
-own `Cargo.toml` somewhere under it). The kind is auto-detected from whether
-`PROGRAM` is a file or a directory, so it's one variable regardless of which
-you're pointing at. Defaults to `fixtures/hello.rs`.
+`demo` compiles whatever `PROGRAM` points at: a single `.rs` file, or a
+directory (a workspace — one or more crates, each with its own `Cargo.toml`
+somewhere under it). The kind is auto-detected from whether `PROGRAM` is a
+file or a directory, so it's one variable regardless of which you're
+pointing at. Defaults to `fixtures/hello.rs`. `DRY=1` switches the whole
+pipeline from real SGX to a native, stub-identity run — there's no
+`--dry-run` flag, since that spelling is already GNU Make's own
+"print-commands-only" flag.
 
 ```bash
-make demo-dry PROGRAM=fixtures/hello.rs                    # default: single no_std file
-make demo-dry PROGRAM=fixtures/workspace-demo              # multi-crate workspace: path
-                                                            # deps, crates.io deps, features,
-                                                            # a global allocator + alloc::format!
-make demo-dry PROGRAM=fixtures/workspace-devdeps-demo DEV=1 # [dev-dependencies]; DEV=1 links them
-                                                            # (only meaningful for a workspace)
-make demo     PROGRAM=path/to/your/workspace                # same, attested inside real SGX
+make demo DRY=1 PROGRAM=fixtures/hello.rs                    # default: single no_std file
+make demo DRY=1 PROGRAM=fixtures/workspace-demo              # multi-crate workspace: path
+                                                              # deps, crates.io deps, features,
+                                                              # a global allocator + alloc::format!
+make demo DRY=1 PROGRAM=fixtures/workspace-devdeps-demo DEV=1 # [dev-dependencies]; DEV=1 links them
+                                                              # (only meaningful for a workspace)
+make demo       PROGRAM=path/to/your/workspace                # same, attested inside real SGX
 ```
 
 Or directly:
